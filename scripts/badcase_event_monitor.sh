@@ -1598,7 +1598,8 @@ count_active_analysis() {
 
 # 注册/注销一个后台分析 pid。$1=msg_id $2=pid（注册）；仅 $1（注销）。
 analysis_pid_track() {
-  local msg_id="$1" pid="${2:-}" f="$STATE_DIR/analysis_pids/${msg_id}.pid"
+  local msg_id="${1:-}" pid="${2:-}" f="$STATE_DIR/analysis_pids/${msg_id:-unknown}.pid"
+  [[ -n "$msg_id" ]] || return 0
   mkdir -p "$STATE_DIR/analysis_pids"
   if [[ -n "$pid" ]]; then echo "$pid" >"$f"; else rm -f "$f"; fi
 }
