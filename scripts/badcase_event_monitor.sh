@@ -740,12 +740,14 @@ autofix_task_file() { echo "$AUTOFIX_TASKS_DIR/task_$1.json"; }
 # 读取任务字段。$1=task_id $2=jq 路径
 autofix_task_get() { local f; f=$(autofix_task_file "$1"); jq -r "$2 // empty" "$f" 2>/dev/null; }
 
-# 写入任务字段。$1=task_id $2=jq 赋值表达式(如 '.state="done"')
+# 写入任务字段。$1=task_id，其余参数透传给 jq（jq 表达式 + 可选 --arg/--argjson）。
+# 例：autofix_task_set "$tid" '.state="done"'
+#     autofix_task_set "$tid" --arg c "SIMPLE_AUTO" '.complexity=$c'
 autofix_task_set() {
-  local task_id="$1" assign="$2"
+  local task_id="$1"; shift
   local f; f=$(autofix_task_file "$task_id")
   local tmp="$f.tmp"
-  jq "$assign" "$f" >"$tmp" 2>/dev/null && mv "$tmp" "$f" || { log "autofix_task_set 失败 task=$task_id assign=$assign"; rm -f "$tmp"; }
+  jq "$@" "$f" >"$tmp" 2>/dev/null && mv "$tmp" "$f" || { log "autofix_task_set 失败 task=$task_id args=$*"; rm -f "$tmp"; }
 }
 
 # 追加讨论上下文（thread 内其他人发言）。$1=task_id $2=sender_name $3=text
@@ -828,10 +830,10 @@ autofix_run_review() {
   span_summary=$(cat "$trace_dir/span_summary.tsv" 2>/dev/null | head -100)
   trace_catalog=$(build_trace_catalog "$trace_details_file" 2>/dev/null)
 
-  # 证据附件：把 trace 完整明细作为附件，让模型可下钻核对
-  local evidence_bundle="$trace_dir/evidence_bundle.json"
-  build_trace_evidence_bundle "$trace_details_file" "$evidence_bundle" 2>/dev/null || evidence_bundle="$trace_details_file"
-
+  # review 阶段需让模型能下钻核对 span 的完整 input/output。trace_details.json 较大
+  # （常超 1MB），不直接用 --attach（易超限）；改为在 prompt 里给出 trace 文件绝对路径，
+  # 让 zcode 在仓库 --cwd 下用 Read 按需读取（trace_dir 在 ~/.badcase_event_state 下，
+  # 绝对路径，--cwd 不影响读取它）。
   local review_prompt
   review_prompt="你是多维表格智能体的自动修复 review agent。下面给你一套独立复核与复杂度评估方法论，请严格按它工作。你工作目录就是 bitable-chatbot 仓库根，可以读代码、grep、glob 来亲自定位根因。
 
@@ -853,14 +855,16 @@ $trace_catalog
 === 完整 span 表 ===
 $span_summary
 
-=== 完整 trace 明细已作为附件提供，可下钻核对 span input/output ===
+=== trace 文件路径（需下钻核对 span input/output 时用 Read 读取，JSON 数组）===
+$trace_details_file
 
 请按方法论步骤 1-5 和输出契约，给出你的独立复核结论、复杂度判定（COMPLEXITY 行）和（若 SIMPLE_AUTO）修改计划（FIX_PLAN 段落）。务必逐行精确包含控制行。"
 
-  # 调 zcode（复用其重试/退避外壳，但 review 是独立预算）
+  # 调 zcode（复用其重试/退避外壳，但 review 是独立预算）。不传附件：trace 路径已写进
+  # prompt，模型按需 Read；避免大文件 --attach 超限。
   local now deadline response
   now=$(date +%s); deadline=$(( now + AUTOFIX_REVIEW_TIMEOUT ))
-  response=$(run_zcode_session "$review_prompt" "$deadline" "$AUTOFIX_REVIEW_ATTEMPT_TIMEOUT" "" "复核" 0 "$evidence_bundle")
+  response=$(run_zcode_session "$review_prompt" "$deadline" "$AUTOFIX_REVIEW_ATTEMPT_TIMEOUT" "" "复核" 0 "")
   if [[ -z "$response" ]]; then
     log "autofix: review zcode 无输出 task=$task_id"
     autofix_finalize_manual "$task_id" "自动复核未产出结果（模型超时或失败），请人工跟进"
