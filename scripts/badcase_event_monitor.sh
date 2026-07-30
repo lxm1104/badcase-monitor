@@ -815,6 +815,10 @@ autofix_on_conclusion_posted() {
 # $1=task_id
 autofix_run_review() {
   local task_id="$1"
+  # 记录 review 进程 pid，供启动恢复逻辑判断"是否已有 review 在跑"，避免重复启动。
+  # 注意：review 在 `( autofix_run_review ) &` 子 shell 里跑，bash 的 $$ 在子 shell 仍是
+  # 父 pid，必须用 $BASHPID 才是子 shell 真实 pid（恢复时 kill -0 校验它）。
+  autofix_task_set "$task_id" --argjson rpid "$BASHPID" '.review_pid=$rpid'
   local root_om trace_id trace_dir run_log_id conclusion_md reported_by
   root_om=$(autofix_task_get "$task_id" '.root_om')
   trace_id=$(autofix_task_get "$task_id" '.trace_id')
@@ -1530,9 +1534,14 @@ log "状态目录与 trace 缓存已初始化"
 # autofix：启动时先扫一遍超时（daemon 重启后补做上一轮挂起的审批超时清理）
 autofix_check_timeouts || true
 # 恢复遗留的 reviewing 任务（daemon 在 review 中途崩了，任务卡在 reviewing）：
-# 没有在跑的 review 进程时，重新启动它们。
+# 仅当该任务没有存活的 review 进程时才重启，避免与正在跑的 review 重复（浪费配额）。
 if (( AUTOFIX_ENABLED == 1 )); then
   for tid in $(autofix_tasks_in_state "reviewing"); do
+    local_review_pid=$(autofix_task_get "$tid" '.review_pid // 0')
+    if [[ "$local_review_pid" != "0" && "$local_review_pid" != "null" ]] && kill -0 "$local_review_pid" 2>/dev/null; then
+      log "autofix: 任务 $tid 的 review 进程 pid=$local_review_pid 仍在跑，跳过恢复"
+      continue
+    fi
     log "autofix: 恢复遗留 reviewing 任务 task=$tid"
     ( autofix_run_review "$tid" || log "autofix: 恢复 review 失败 task=$tid rc=$?" ) >>"$LOG_FILE" 2>&1 &
   done
