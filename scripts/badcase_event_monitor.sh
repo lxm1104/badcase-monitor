@@ -235,10 +235,11 @@ run_zcode_session() (
   local err="$STATE_DIR/zcode_$$.err"
   local attempt=0 response="" zcode_pid=""
   cleanup_zcode_session() {
-    if [[ -n "$zcode_pid" ]] && kill -0 "$zcode_pid" 2>/dev/null; then
+    # set -u 下，trap 触发的嵌套函数可能看不到子 shell 的 local 变量，加 :- 兜底。
+    if [[ -n "${zcode_pid:-}" ]] && kill -0 "$zcode_pid" 2>/dev/null; then
       kill -TERM "$zcode_pid" 2>/dev/null || true
     fi
-    rm -f "$tmp" "$err"
+    rm -f "${tmp:-}" "${err:-}"
   }
   trap cleanup_zcode_session EXIT
   trap 'exit 143' INT TERM
