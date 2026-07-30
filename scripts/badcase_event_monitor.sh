@@ -1677,10 +1677,10 @@ fi
 # 恢复中断的分析任务：daemon 上次被 kill 时，正在后台分析的 case 任务文件会残留
 # （analyze 链路中途断了，没走到 analysis_task_remove）。重新派活后台分析续上，不丢失。
 # 已在 processed 账本里的才恢复（避免重投）；并发受 MAX_CONCURRENT_ANALYSIS 限制。
-local _atf
+# 注意：这段在脚本顶层，不能用 local 关键字。
+_atf=""
 for _atf in "$ANALYSIS_TASKS_DIR"/task_*.json; do
   [[ -f "$_atf" ]] || continue
-  local _mid _content _root _lids _epoch
   _mid=$(jq -r '.message_id // empty' "$_atf" 2>/dev/null)
   _content=$(jq -r '.content // empty' "$_atf" 2>/dev/null)
   _root=$(jq -r '.root_msg_id // empty' "$_atf" 2>/dev/null)
@@ -1688,7 +1688,6 @@ for _atf in "$ANALYSIS_TASKS_DIR"/task_*.json; do
   _epoch=$(jq -r '.event_started_epoch // 0' "$_atf" 2>/dev/null)
   [[ -z "$_mid" || -z "$_lids" ]] && { rm -f "$_atf"; continue; }
   # 已分析超 1 小时的（预算已耗尽）不再恢复，避免重启后跑老到期的任务
-  local _now _elapsed
   _now=$(date +%s); _elapsed=$(( _now - _epoch ))
   (( _elapsed > ANALYSIS_TOTAL_TIMEOUT )) && { log "分析任务 $_mid 已超预算(${_elapsed}s)，丢弃"; rm -f "$_atf"; continue; }
   log "恢复中断的分析任务 $_mid（已用时 ${_elapsed}s）"
