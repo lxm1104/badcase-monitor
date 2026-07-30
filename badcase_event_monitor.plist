@@ -1,0 +1,63 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!--
+  Badcase 群事件订阅 daemon - macOS launchd 常驻任务
+
+  与 feishu_feedback_monitor.plist 的根本差异：
+    - 那是「轮询 one-shot」：StartInterval 触发，每次拉增量后退出，故无 KeepAlive。
+    - 本是「事件订阅长连接」：consume 常驻，故必须 KeepAlive=true + RunAtLoad=true，无 StartInterval。
+    KeepAlive 保证 consume 崩溃/断线后 launchd 自动重启脚本；RunAtLoad 保证登录即起。
+
+  安装方式：
+    1. 编辑本文件，确认 HOME 路径与脚本路径正确（launchd 不展开 ~）。
+    2. cp badcase_event_monitor.plist ~/Library/LaunchAgents/com.xinming.badcase-event-monitor.plist
+    3. launchctl load ~/Library/LaunchAgents/com.xinming.badcase-event-monitor.plist
+  卸载：
+    launchctl unload ~/Library/LaunchAgents/com.xinming.badcase-event-monitor.plist
+  查看日志：tail -f ~/.badcase_event_state/monitor.log
+  立即重启一次：launchctl kickstart -k gui/$(id -u)/com.xinming.badcase-event-monitor
+  查看状态：launchctl list | grep badcase-event-monitor
+
+  注意：
+    - launchd 默认 StandardInput=null。脚本内部 consume 用了 --max-events 上限（非 unbounded），
+      所以 stdin EOF 不会让 consume 提前退出；到达上限后退出由 KeepAlive 重启。
+    - 敏感配置（API key）不在本 plist 明文，脚本会 source ~/.badcase_event_env 读取。
+    - 单实例锁由脚本内 flock 保证，即使 launchd 误启两个也只有一个会真正 consume。
+-->
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>com.xinming.badcase-event-monitor</string>
+
+    <key>ProgramArguments</key>
+    <array>
+        <string>/Users/xinming/MyProject/working-workspace/badcase-daemon/scripts/badcase_event_monitor.sh</string>
+    </array>
+
+    <key>EnvironmentVariables</key>
+    <dict>
+        <key>HOME</key>
+        <string>/Users/xinming</string>
+        <key>PATH</key>
+        <string>/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin:/opt/homebrew/bin:/Users/xinming/.npm-global/bin</string>
+    </dict>
+
+    <!-- 长连接 daemon：崩溃/退出后立即重启（KeepAlive=true 比 SuccessfulExit=false 更稳，
+         因为 consume 正常退出到达 max_events 时也是 exit 0，仍需重启继续消费）。 -->
+    <key>KeepAlive</key>
+    <true/>
+
+    <!-- 登录/加载即启动，不等周期（无 StartInterval）。 -->
+    <key>RunAtLoad</key>
+    <true/>
+
+    <!-- 崩溃后重启间隔，避免快速崩溃循环打满 CPU（launchd 会指数退避，这里显式设下限）。 -->
+    <key>ThrottleInterval</key>
+    <integer>10</integer>
+
+    <key>StandardOutPath</key>
+    <string>/Users/xinming/.badcase_event_state/launchd.out.log</string>
+    <key>StandardErrorPath</key>
+    <string>/Users/xinming/.badcase_event_state/launchd.err.log</string>
+</dict>
+</plist>

@@ -1,0 +1,30 @@
+# 真值配置（密钥），绝不可提交。真值文件本身在仓库外的 ~/.badcase_event_env
+*.env
+.badcase_event_env
+badcase_event_env
+
+# 运行时状态目录（trace 缓存、幂等账本、pid、fifo、日志）—— 本在仓库外，此处防御性屏蔽
+.badcase_event_state/
+**/traces/
+*.pid
+*.fifo
+events.fifo
+
+# 日志
+*.log
+launchd.err.log
+launchd.out.log
+monitor.log
+
+# zcode 会话临时响应
+zcode_*.json
+zcode_*.err
+reply_*.md
+failed_reply_*.md
+
+# macOS
+.DS_Store
+
+# Node
+node_modules/
+package-lock.json
