@@ -98,6 +98,9 @@ LARK_SEND_RETRY_BACKOFF="${LARK_SEND_RETRY_BACKOFF:-10}"
 
 LOG_FILE="${BADCASE_MONITOR_LOG:-$STATE_DIR/monitor.log}"
 PROCESSED_FILE="${PROCESSED_FILE:-$STATE_DIR/processed_events.txt}"   # message_id 幂等账本
+# 已分析过（已发结论帖）的日志ID账本：同一日志ID/trace 在同 thread 或跨 thread 再次出现时不再重复分析。
+# 结论帖发出成功后写入；process_event 抽到日志ID后先过滤掉这里的，避免重复回复。
+ANALYZED_LOGIDS_FILE="${ANALYZED_LOGIDS_FILE:-$STATE_DIR/analyzed_logids.txt}"
 PID_FILE="$STATE_DIR/badcase_event_monitor.pid"
 
 # consume 安全上限：到达后退出，由 launchd KeepAlive 重启。
@@ -143,7 +146,7 @@ ANALYSIS_TASKS_DIR="${ANALYSIS_TASKS_DIR:-$STATE_DIR/analysis_tasks}"
 
 mkdir -p "$STATE_DIR" "$(dirname "$LOG_FILE")" "$STATE_DIR/traces" "$AUTOFIX_TASKS_DIR" "$ANALYSIS_TASKS_DIR"
 chmod 700 "$STATE_DIR" 2>/dev/null || true
-touch "$PROCESSED_FILE" "$AUTOFIX_CONCLUSIONS_FILE"
+touch "$PROCESSED_FILE" "$AUTOFIX_CONCLUSIONS_FILE" "$ANALYZED_LOGIDS_FILE"
 
 log() { echo "[$(date '+%Y-%m-%d %H:%M:%S')] $*" | tee -a "$LOG_FILE" >&2; }
 die() { log "ERROR: $*"; exit 1; }
@@ -461,6 +464,11 @@ strip_analysis_control_lines() {
 # 幂等：检查 message_id 是否已处理过。$1=msg_id
 is_processed() { grep -qxF "$1" "$PROCESSED_FILE" 2>/dev/null; }
 mark_processed() { echo "$1" >>"$PROCESSED_FILE"; }
+
+# 已分析日志ID账本：避免同一日志ID在后续消息里重复触发分析（结论已发就不再回复）。
+# 结论帖发出成功后用 mark_logid_analyzed 记录；抽到日志ID后用 is_logid_analyzed 过滤。
+is_logid_analyzed() { grep -qxF "$1" "$ANALYZED_LOGIDS_FILE" 2>/dev/null; }
+mark_logid_analyzed() { echo "$1" >>"$ANALYZED_LOGIDS_FILE"; }
 
 # 用裸数字在日志里搜，如果它是 StepID 则从同一行抽真正的 RunLogID。
 # 高频误用：用户从 CCM 页面复制的是「步骤 ID」(StepID) 而非「日志 ID」(RunLogID)，
@@ -1562,6 +1570,12 @@ _正在按上述 span_id 拉取完整 input/output，继续调查。_" "ev${evid
   fi
   log "完成处理 $msg_id (trace=$first_trace)"
 
+  # 记录已分析账本：该日志ID + trace 已发结论，后续消息再出现同样的 ID/trace 不再重复分析。
+  # 裸存（日志ID 19位数字、trace 32位hex 格式不同不会冲突），过滤时 extract_log_ids 抽出的
+  # 也是裸值，直接 grep -xF 匹配。
+  mark_logid_analyzed "$first_log_id"
+  [[ -n "$first_trace" ]] && mark_logid_analyzed "$first_trace"
+
   # autofix 触发：结论帖发出成功后，启动自动修复流程（复核→计划→审批→改码→MR）。
   # 仅在 autofix 启用时；trace_dir 复用本次已抓缓存，避免重复抓取。
   # 报案人名尝试从合并转发正文「发送者:」提取，取不到留空（计划帖用兜底文案）。
@@ -1727,6 +1741,27 @@ process_event() {
   local total_ids
   total_ids=$(echo "$log_ids" | wc -l | tr -d ' ')
   log "抽取到日志ID: $(echo "$log_ids" | tr '\n' ' ')（共 ${total_ids} 条）"
+
+  # 去重：过滤掉已分析过（已发结论帖）的日志ID，避免同 thread 后续消息重复回复分析。
+  # --once 调试模式（FORCED_LOG_ID）跳过此过滤，允许手动重跑。
+  if [[ -z "$FORCED_LOG_ID" ]]; then
+    local new_log_ids="" lid
+    while IFS= read -r lid; do
+      [[ -z "$lid" ]] && continue
+      if is_logid_analyzed "$lid"; then
+        log "日志ID $lid 已分析过（结论已发），跳过"
+      else
+        new_log_ids="${new_log_ids:+$new_log_ids$'\n'}$lid"
+      fi
+    done <<< "$log_ids"
+    if [[ -z "$new_log_ids" ]]; then
+      log "所有日志ID均已分析过，跳过 $msg_id（不再重复回复）"
+      mark_processed "$msg_id"
+      return
+    fi
+    log_ids="$new_log_ids"
+    total_ids=$(echo "$log_ids" | wc -l | tr -d ' ')
+  fi
 
   # --once 调试模式：同步跑完（跑一条就退出，无需后台化，便于观察完整输出）。
   if [[ -n "$ONLY_MSG_ID" ]]; then
