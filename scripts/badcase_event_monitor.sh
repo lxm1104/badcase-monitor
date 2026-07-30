@@ -334,14 +334,23 @@ run_zcode_session() (
 # $1 = 待抽取文本
 extract_log_ids() {
   local text="$1"
+  # Fornax trace URL 里的 trace_id（32位hex）：fornax.../trace/<hex>
+  # 坏case 常贴 fornax 链接，URL 里 /space/<id>/analytics/trace/<trace_id> 的 trace_id 是有效的。
+  echo "$text" | grep -oiE 'fornax[^[:space:]]*/trace/[0-9a-f]{32}' \
+    | grep -oiE '[0-9a-f]{32}' 2>/dev/null || true
   # 结构化关键词：日志ID / run_log_id / trace_id 后跟数字（15-20 位）
   echo "$text" | grep -oE '(日志\s*[iI][dD]|run[_-]?log[_-]?[iI][dD]|log[_-]?[iI][dD]|trace[_-]?[iI][dD])[:：\s]*[0-9]{15,20}' \
     | grep -oE '[0-9]{15,20}' 2>/dev/null || true
-  # 兜底：裸 19 位数字（7 开头，run_log_id 典型形态）。但 uid/user_id 也是相同
-  # 形态，若原文已明确标注为用户 ID，必须排除，避免误查 trace 并发送误导评论。
+  # 兜底：裸 19 位数字（7 开头，run_log_id 典型形态）。需排除几类同形态误识别：
+  #   - uid/user_id（原文标注）
+  #   - Fornax URL 里的 space ID（fornax.../space/<id>/...），它是空间ID不是日志ID
   local candidate
   echo "$text" | grep -oE '\b7[0-9]{18}\b' 2>/dev/null | while IFS= read -r candidate; do
     if echo "$text" | grep -qiE "(uid|user[_ -]?[iI][dD]|用户[[:space:]]*[iI][dD])[:：[:space:]]*${candidate}"; then
+      continue
+    fi
+    # 排除 Fornax URL 里的 space ID：数字紧跟在 fornax host 的 /space/ 之后
+    if echo "$text" | grep -qiE "fornax[^[:space:]]*/space/${candidate}"; then
       continue
     fi
     echo "$candidate"
