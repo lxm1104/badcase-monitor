@@ -867,18 +867,37 @@ autofix_run_review() {
   run_log_id=$(autofix_task_get "$task_id" '.run_log_id')
   conclusion_md=$(autofix_task_get "$task_id" '.conclusion_md')
   reported_by=$(autofix_task_get "$task_id" '.reported_by')
-  [[ -d "$trace_dir" ]] || { log "autofix: trace_dir 不存在 $trace_dir"; autofix_finalize_manual "$task_id" "trace 缓存目录丢失，无法复核"; return 1; }
-
-  local skill_methodology span_summary trace_catalog trace_details_file
-  trace_details_file="$trace_dir/trace_details.json"
+  # 兼容「基于已有结论触发」：可能没有 trace 缓存（如 bot 帖的 trace 没抓过）。
+  # trace_dir 存在 → 注入完整 trace 数据复核；不存在 → 只用结论文字 + 读代码复核。
+  local skill_methodology trace_section=""
   skill_methodology=$(cat "$AUTOFIX_REVIEW_SKILL" 2>/dev/null)
-  span_summary=$(cat "$trace_dir/span_summary.tsv" 2>/dev/null | head -100)
-  trace_catalog=$(build_trace_catalog "$trace_details_file" 2>/dev/null)
+  if [[ -n "$trace_dir" && -d "$trace_dir" ]]; then
+    local span_summary trace_catalog trace_details_file
+    trace_details_file="$trace_dir/trace_details.json"
+    span_summary=$(cat "$trace_dir/span_summary.tsv" 2>/dev/null | head -100)
+    trace_catalog=$(build_trace_catalog "$trace_details_file" 2>/dev/null)
+    # trace_details.json 较大（常超 1MB），不直接 --attach（易超限）；在 prompt 里给出
+    # trace 文件绝对路径，让 zcode 用 Read 按需读取。
+    trace_section="
+=== 完整 span 目录 ===
+$trace_catalog
 
-  # review 阶段需让模型能下钻核对 span 的完整 input/output。trace_details.json 较大
-  # （常超 1MB），不直接用 --attach（易超限）；改为在 prompt 里给出 trace 文件绝对路径，
-  # 让 zcode 在仓库 --cwd 下用 Read 按需读取（trace_dir 在 ~/.badcase_event_state 下，
-  # 绝对路径，--cwd 不影响读取它）。
+=== 完整 span 表 ===
+$span_summary
+
+=== trace 文件路径（需下钻核对 span input/output 时用 Read 读取，JSON 数组）===
+$trace_details_file
+"
+  else
+    log "autofix: 无 trace 缓存，review 改为基于结论文字 + 读代码复核 task=$task_id"
+    trace_section="
+=== 无 trace 缓存 ===
+本次是基于已有结论帖触发的复核，没有 trace 明细。请主要依据下方「结论帖内容」里的根因描述，
+在仓库代码里亲自读代码验证结论是否成立、定位修复点、评估复杂度。若结论信息不足以定位代码根因，
+判 MANUAL 并说明需要补充什么。
+"
+  fi
+
   local review_prompt
   review_prompt="你是多维表格智能体的自动修复 review agent。下面给你一套独立复核与复杂度评估方法论，请严格按它工作。你工作目录就是 bitable-chatbot 仓库根，可以读代码、grep、glob 来亲自定位根因。
 
@@ -893,15 +912,7 @@ $conclusion_md
 $run_log_id
 === trace_id ===
 $trace_id
-
-=== 完整 span 目录 ===
-$trace_catalog
-
-=== 完整 span 表 ===
-$span_summary
-
-=== trace 文件路径（需下钻核对 span input/output 时用 Read 读取，JSON 数组）===
-$trace_details_file
+$trace_section
 
 请按方法论步骤 1-5 和输出契约，给出你的独立复核结论、复杂度判定（COMPLEXITY 行）和（若 SIMPLE_AUTO）修改计划（FIX_PLAN 段落）。务必逐行精确包含控制行。"
 
@@ -1061,6 +1072,81 @@ autofix_check_approval_reply() {
   done
   # 未命中任何 awaiting_approval 任务 → 返回非 0，让 process_event 继续走正常 case 处理
   return 1
+}
+
+# ---- 基于已有结论触发 autofix ----
+# 用户（仅刘昕明）在某个结论帖的 thread 里回复触发词（autofix/自动修复/修一下/fix一下）时，
+# 基于该 thread 根消息（结论帖）的内容创建 autofix 任务并启动 review。
+# 覆盖「bot 自发消息事件订阅收不到」的场景：daemon 不用收到 bot 帖，只要用户在下面回复触发词。
+# 在 process_event 里、审批检测之后、抽日志ID之前调用。返回 0=已处理，1=未命中。
+autofix_check_conclusion_trigger() {
+  (( AUTOFIX_ENABLED == 1 )) || return 1
+  local evt="$1"
+  local msg_id sender_id content
+  msg_id=$(echo "$evt" | jq -r '.message_id // empty')
+  sender_id=$(echo "$evt" | jq -r '.sender_id // .sender.id // .sender.sender_id.open_id // .sender.open_id // empty')
+  content=$(echo "$evt" | jq -r '.content // ""')
+  [[ -z "$msg_id" ]] && return 1
+  # 仅审批人（刘昕明）可触发
+  [[ -n "$sender_id" && "$sender_id" == "$AUTOFIX_REVIEWER_OPEN_ID" ]] || return 1
+  # 触发词（大小写不敏感）。兼容中英文混排空格。
+  echo "$content" | grep -qiE 'autofix|自动修复|修一下|fix[[:space:]]?一下|fix[[:space:]]?下|这个能.{0,4}修|能自动修' || return 1
+
+  # mget 本消息拿 thread_id（判断属于哪个 thread）
+  local mget_json msg_thread_id
+  mget_json=$(lark-cli im +messages-mget --message-ids "$msg_id" --as user --no-reactions --json 2>/dev/null || true)
+  msg_thread_id=$(echo "$mget_json" | jq -r '.data.messages[0].thread_id // empty' 2>/dev/null || true)
+  [[ -n "$msg_thread_id" ]] || return 1   # 非话题回复，无法定位结论帖
+
+  # 拉该 thread 的根消息（结论帖）：threads-messages-list order asc 取第一条
+  local root_om conclusion_md
+  local thread_json
+  thread_json=$(lark-cli im +threads-messages-list --thread "$msg_thread_id" --as user --order asc --page-size 5 --no-reactions --json 2>/dev/null || true)
+  root_om=$(echo "$thread_json" | jq -r '.data.messages[0].message_id // empty' 2>/dev/null || true)
+  conclusion_md=$(echo "$thread_json" | jq -r '.data.messages[0].content // empty' 2>/dev/null || true)
+  [[ -n "$conclusion_md" ]] || { log "autofix: 结论帖正文为空 thread=$msg_thread_id"; return 1; }
+
+  # 从结论帖正文提取 trace_id（32位hex）/ run_log_id（19位7开头）
+  local trace_id run_log_id
+  trace_id=$(echo "$conclusion_md" | grep -oE '[0-9a-f]{32}' | head -1 || true)
+  run_log_id=$(echo "$conclusion_md" | grep -oE '\b7[0-9]{18}\b' | head -1 || true)
+
+  # 幂等 + task_id 派生：优先 trace_，无 trace 用根消息 om_
+  local task_id
+  if [[ -n "$trace_id" ]]; then
+    task_id="trace_$trace_id"
+  else
+    task_id="omconcl_${root_om#om_}"
+  fi
+  local f; f=$(autofix_task_file "$task_id")
+  [[ -f "$f" ]] && { log "autofix: 结论帖 $root_om 已有任务 $task_id，跳过"; return 0; }
+  grep -qxF "${root_om}:${task_id}" "$AUTOFIX_CONCLUSIONS_FILE" 2>/dev/null && { log "autofix: 结论 $root_om 已触发过"; return 0; }
+
+  # trace 缓存目录（可能不存在，review 会兼容）
+  local trace_dir=""
+  [[ -n "$trace_id" ]] && trace_dir="$STATE_DIR/traces/trace_${trace_id}"
+
+  # 创建任务 JSON
+  local now; now=$(date +%s)
+  jq -n \
+    --arg tid "$task_id" --arg root "$root_om" \
+    --arg tid2 "${trace_id:-}" --arg tdir "$trace_dir" --arg rlid "${run_log_id:-}" \
+    --arg conc "$conclusion_md" --arg rb "结论帖" --argjson now "$now" \
+    '{task_id:$tid,state:"reviewing",root_om:$root,trace_id:$tid2,trace_dir:$tdir,run_log_id:$rlid,
+      conclusion_md:$conc,reported_by:$rb,complexity:"",root_cause:"",fix_plan:"",
+      plan_msg_om:"",created_epoch:$now,approved_epoch:0,mr_url:"",mr_number:"",
+      branch:"",commit_hash:"",review_pid:0,
+      discussion_context:[],failures:0,last_error:""}' >"$f" 2>/dev/null
+  if [[ ! -s "$f" ]]; then log "autofix: 结论触发创建任务失败 $task_id"; rm -f "$f"; return 1; fi
+  echo "${root_om}:${task_id}" >>"$AUTOFIX_CONCLUSIONS_FILE"
+  log "autofix: 基于结论帖触发 review task=$task_id root=$root_om (后台启动)"
+
+  # 回复确认 + 后台启动 review
+  reply_thread "$root_om" "**[自动修复·已收到]** 检测到修复请求，开始独立复核该结论并在代码中定位修复点，稍后给出修改计划。" "afrecv-${task_id}" 2>/dev/null || true
+  (
+    autofix_run_review "$task_id" || log "autofix: review 失败 task=$task_id rc=$?"
+  ) >>"$LOG_FILE" 2>&1 &
+  return 0
 }
 
 # ---- 执行阶段：zcode 全自动改码 + 提 MR ----
@@ -1585,6 +1671,12 @@ process_event() {
   # 刘昕明（user）的审批回复和同事们的讨论。
   if (( AUTOFIX_ENABLED == 1 )) && [[ "$sender_type" != "bot" ]]; then
     if autofix_check_approval_reply "$evt"; then
+      mark_processed "$msg_id"
+      return
+    fi
+    # 基于已有结论触发 autofix：刘昕明在结论帖 thread 回复触发词（autofix/修一下）时，
+    # 基于该 thread 根消息的结论创建任务。覆盖 bot 自发消息事件订阅收不到的场景。
+    if autofix_check_conclusion_trigger "$evt"; then
       mark_processed "$msg_id"
       return
     fi
