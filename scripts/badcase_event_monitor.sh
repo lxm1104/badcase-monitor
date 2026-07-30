@@ -948,7 +948,9 @@ autofix_check_approval_reply() {
   local evt="$1"
   local msg_id sender_id content
   msg_id=$(echo "$evt" | jq -r '.message_id // empty')
-  sender_id=$(echo "$evt" | jq -r '.sender_id // .sender.sender_id.open_id // .sender.open_id // empty')
+  # sender_id 取值兼容两种来源：事件订阅 flat 结构的 .sender_id（open_id），
+  # 以及 mget 返回的 .sender.id（审批检测会回查 mget 补字段）。两者都是 open_id。
+  sender_id=$(echo "$evt" | jq -r '.sender_id // .sender.id // .sender.sender_id.open_id // .sender.open_id // empty')
   content=$(echo "$evt" | jq -r '.content // ""')
   [[ -z "$msg_id" ]] && return 1
 
@@ -983,18 +985,24 @@ autofix_check_approval_reply() {
 
     # 是审批人（刘昕明）的回复 → 判同意/反对
     if [[ -n "$sender_id" && "$sender_id" == "$AUTOFIX_REVIEWER_OPEN_ID" ]]; then
-      # 反对词优先（不同意/别改/等等/撤销 等）→ 中止
-      if echo "$content" | grep -qiE '不同意|不要|别改|等等|再想想|停下|撤销|反对|放弃|abort'; then
+      # 同意优先：先看是否有明确同意意图。同意词命中即视为批准（即便句中带"不要枚举"
+      # 之类的局部否定——那是修改建议，不是拒绝修改）。
+      if echo "$content" | grep -qE '同意|赞同|赞成|批准|可以改|改吧|LGTM|同意了|确认|可以[，,。!\s]|可以的'; then
+        autofix_task_set "$tid" --argjson t "$(date +%s)" '.approved_epoch=$t | .state="executing"'
+        log "autofix: 收到同意，启动执行 task=$tid"
+        reply_thread "$root_om" "**[自动修复·开始执行]** 收到同意，正在自动修改并提交 MR，请稍候……" "afstart-${tid#trace_}" 2>/dev/null || true
+        # 审批回复本身也作为讨论上下文保留（可能含修改意见，如"尽量简单"）
+        autofix_task_add_discussion "$tid" "刘昕明(审批)" "$content"
+        ( autofix_execute "$tid" || log "autofix: 执行失败 task=$tid rc=$?" ) >>"$LOG_FILE" 2>&1 &
+        return 0
+      fi
+      # 没有同意意图时，才判反对（整体拒绝修改）→ 中止
+      if echo "$content" | grep -qiE '不同意|不要改|别改|先别改|等等|再想想|停下|撤销|反对|放弃|abort|不用了'; then
         autofix_task_set "$tid" --argjson t "$(date +%s)" '.state="done" | .approved_epoch=0'
         reply_thread "$root_om" '**[自动修复·已中止]** 收到反对意见，已停止本次自动修改。' "afstop-${tid#trace_}" 2>/dev/null || true
         log "autofix: 收到反对，中止 task=$tid"
         return 0
       fi
-      # 同意词 → 转 executing，后台启动执行
-      if echo "$content" | grep -qE '同意|赞同|赞成|批准|可以改|改吧|LGTM|同意了|确认'; then
-        autofix_task_set "$tid" --argjson t "$(date +%s)" '.approved_epoch=$t | .state="executing"'
-        log "autofix: 收到同意，启动执行 task=$tid"
-        reply_thread "$root_om" "**[自动修复·开始执行]** 收到同意，正在自动修改并提交 MR，请稍候……" "afstart-${tid#trace_}" 2>/dev/null || true
         ( autofix_execute "$tid" || log "autofix: 执行失败 task=$tid rc=$?" ) >>"$LOG_FILE" 2>&1 &
         return 0
       fi
@@ -1514,10 +1522,13 @@ if [[ -n "$ONLY_MSG_ID" ]]; then
   local_evt=$(lark-cli im +messages-mget --message-ids "$ONLY_MSG_ID" --as user --format json 2>>"$LOG_FILE" \
     | jq -c '.data.messages[0] // empty')
   if [[ -z "$local_evt" ]]; then die "拉不到消息 $ONLY_MSG_ID"; fi
-  # mget 返回结构与事件略不同：补上事件期望的字段映射
+  # mget 返回结构与事件略不同：补上事件期望的字段映射。
+  # 关键：必须带上 sender_id（审批检测用它判定是否审批人），否则 --once 重放审批回复
+  # 会被误当"非审批人讨论"。
   local_evt=$(echo "$local_evt" | jq -c '{
     message_id:.message_id, message_type:.msg_type, content:.content,
-    sender:{sender_type:(.sender.sender_type//"user")}}')
+    sender_id:(.sender.id // .sender.sender_id // empty),
+    sender:{sender_type:(.sender.sender_type//"user"), id:(.sender.id // empty)}}')
   process_event "$local_evt"
   log "===== 调试结束 ====="
   exit 0
