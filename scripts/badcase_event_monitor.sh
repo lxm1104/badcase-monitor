@@ -131,9 +131,14 @@ AUTOFIX_CONCLUSIONS_FILE="${AUTOFIX_CONCLUSIONS_FILE:-$STATE_DIR/autofix_process
 AUTOFIX_REVIEW_SKILL="${AUTOFIX_REVIEW_SKILL:-$DAEMON_ROOT/skills/autofix-review/SKILL.md}"
 AUTOFIX_EXECUTE_SKILL="${AUTOFIX_EXECUTE_SKILL:-$DAEMON_ROOT/skills/autofix-execute/SKILL.md}"
 # ============ autofix 配置结束 ============
+# 后台分析并发上限：同一时刻最多并行分析多少条消息（防并发抢爆 bigmodel 配额）。
+# 超出的消息在主循环里暂存，待有空位再派活（任务文件保留，不会丢）。
+MAX_CONCURRENT_ANALYSIS="${MAX_CONCURRENT_ANALYSIS:-3}"
+# 分析任务持久化目录（用于后台化派活 + kill 后启动恢复，见 process_event / 启动恢复逻辑）
+ANALYSIS_TASKS_DIR="${ANALYSIS_TASKS_DIR:-$STATE_DIR/analysis_tasks}"
 # ============ 配置结束 ============
 
-mkdir -p "$STATE_DIR" "$(dirname "$LOG_FILE")" "$STATE_DIR/traces" "$AUTOFIX_TASKS_DIR"
+mkdir -p "$STATE_DIR" "$(dirname "$LOG_FILE")" "$STATE_DIR/traces" "$AUTOFIX_TASKS_DIR" "$ANALYSIS_TASKS_DIR"
 chmod 700 "$STATE_DIR" 2>/dev/null || true
 touch "$PROCESSED_FILE" "$AUTOFIX_CONCLUSIONS_FILE"
 
@@ -169,21 +174,26 @@ if [[ "$AUTOFIX_ENABLED" == "1" ]]; then
   fi
 fi
 
-# 单实例锁：两个 consumer 订阅同一 EventKey 会报 "subscription already exists" 并重复投递。
+# 单实例锁（仅常驻 consume 模式需要）：两个 consumer 订阅同一 EventKey 会报
+# "subscription already exists" 并重复投递。--once / --once-autofix 不启动 consume，
+# 不需要锁，可与常驻 daemon 同时运行（补跑/调试无需停 daemon）。
 # macOS 无 flock，用自带的 shlock（原子写 pid 文件；若文件已存在且 pid 存活则失败）。
-# 先清理上一轮残留的空/孤儿 pid 文件：若 pid 不在运行就删，避免误判。
-if [[ -f "$PID_FILE" ]]; then
-  old_pid=$(cat "$PID_FILE" 2>/dev/null || echo "")
-  if [[ -z "$old_pid" ]] || ! kill -0 "$old_pid" 2>/dev/null; then
-    rm -f "$PID_FILE"
+acquire_singleton_lock() {
+  # 先清理上一轮残留的空/孤儿 pid 文件：若 pid 不在运行就删，避免误判。
+  if [[ -f "$PID_FILE" ]]; then
+    local old_pid
+    old_pid=$(cat "$PID_FILE" 2>/dev/null || echo "")
+    if [[ -z "$old_pid" ]] || ! kill -0 "$old_pid" 2>/dev/null; then
+      rm -f "$PID_FILE"
+    fi
   fi
-fi
-if ! shlock -p $$ -f "$PID_FILE"; then
-  die "另一个实例正在运行 (pid=$(cat "$PID_FILE" 2>/dev/null))。如确认无残留：rm $PID_FILE"
-fi
-trap 'rm -f "$PID_FILE"' EXIT
+  if ! shlock -p $$ -f "$PID_FILE"; then
+    die "另一个常驻实例正在运行 (pid=$(cat "$PID_FILE" 2>/dev/null))。如确认无残留：rm $PID_FILE。补跑/调试请用 --once/--once-autofix，无需停 daemon。"
+  fi
+  trap 'rm -f "$PID_FILE"' EXIT
+}
 
-# ---- 参数解析 ----
+# ---- 参数解析（在锁之前，便于根据模式决定是否拿锁）----
 DRY_REPLY=0
 ONLY_MSG_ID=""
 FORCED_LOG_ID=""
@@ -1426,6 +1436,84 @@ _正在按上述 span_id 拉取完整 input/output，继续调查。_" "ev${evid
   fi
 }
 
+# ============================================================
+# ===== 分析阶段后台化辅助：并发控制 + 任务持久化 ==========
+# 主循环派活后立即返回，后台子进程跑完整分析链路，不阻塞事件消费。
+# 并发上限 MAX_CONCURRENT_ANALYSIS 用 analysis_pids/ 目录计数控制。
+# 任务文件 analysis_tasks/ 供 kill 后启动恢复（改动3）。
+# ============================================================
+
+# 当前在跑的后台分析子进程数（通过存活的 pid 文件计数）。
+count_active_analysis() {
+  local d="$STATE_DIR/analysis_pids" cnt=0 f pid
+  [[ -d "$d" ]] || { echo 0; return; }
+  for f in "$d"/*.pid; do
+    [[ -f "$f" ]] || continue
+    pid=$(cat "$f" 2>/dev/null || echo "")
+    if [[ -n "$pid" ]] && kill -0 "$pid" 2>/dev/null; then
+      cnt=$((cnt + 1))
+    else
+      rm -f "$f"   # 顺手清理已退出的 pid 文件
+    fi
+  done
+  echo "$cnt"
+}
+
+# 注册/注销一个后台分析 pid。$1=msg_id $2=pid（注册）；仅 $1（注销）。
+analysis_pid_track() {
+  local msg_id="$1" pid="${2:-}" f="$STATE_DIR/analysis_pids/${msg_id}.pid"
+  mkdir -p "$STATE_DIR/analysis_pids"
+  if [[ -n "$pid" ]]; then echo "$pid" >"$f"; else rm -f "$f"; fi
+}
+
+# 非阻塞回收已退出的后台分析子进程（防 zombie）。count_active_analysis 已清 pid 文件，
+# 这里对已不在的 pid 调 wait 回收内核里的 zombie（wait 对已退出 pid 立即返回）。
+reap_analysis_zombies() {
+  local d="$STATE_DIR/analysis_pids" f pid
+  [[ -d "$d" ]] || return 0
+  for f in "$d"/*.pid; do
+    [[ -f "$f" ]] || continue
+    pid=$(cat "$f" 2>/dev/null || echo "")
+    [[ -n "$pid" ]] || { rm -f "$f"; continue; }
+    if ! kill -0 "$pid" 2>/dev/null; then
+      wait "$pid" 2>/dev/null || true   # 回收 zombie
+      rm -f "$f"
+    fi
+  done
+}
+
+# 后台分析入口：在子 shell 里跑完整链路（多日志ID串行），跑完注销 pid + 删任务文件。
+# 参数同 analyze_one_log_id 的外层包装：log_ids / content / msg_id / root_msg_id / epoch
+run_analysis_background() {
+  local log_ids="$1" content="$2" msg_id="$3" root_msg_id="$4" event_started_epoch="$5"
+  (
+    trap 'analysis_pid_track "$_BG_MSG_ID" ""' EXIT
+    _BG_MSG_ID="$msg_id"
+    local log_id idx=0
+    local total_ids
+    total_ids=$(echo "$log_ids" | wc -l | tr -d ' ')
+    while IFS= read -r log_id; do
+      [[ -z "$log_id" ]] && continue
+      idx=$((idx + 1))
+      (( total_ids > 1 )) && log "处理第 ${idx}/${total_ids} 条日志ID: $log_id"
+      analyze_one_log_id "$log_id" "$content" "$msg_id" "$root_msg_id" "$event_started_epoch" \
+        || log "日志ID $log_id 处理失败，继续下一条"
+    done <<< "$log_ids"
+    analysis_task_remove "$msg_id"
+    log "后台分析完成 $msg_id"
+  ) >>"$LOG_FILE" 2>&1 &
+}
+
+# 任务文件读写（供 kill 后启动恢复）。
+analysis_task_write() {
+  local msg_id="$1" content="$2" root_msg_id="$3" log_ids="$4" epoch="$5"
+  local f="$ANALYSIS_TASKS_DIR/task_${msg_id}.json"
+  jq -n --arg mid "$msg_id" --arg c "$content" --arg root "$root_msg_id" \
+        --arg lids "$log_ids" --argjson e "$epoch" \
+    '{message_id:$mid,content:$c,root_msg_id:$root,log_ids:$lids,event_started_epoch:$e}' >"$f" 2>/dev/null
+}
+analysis_task_remove() { rm -f "$ANALYSIS_TASKS_DIR/task_${1}.json" 2>/dev/null || true; }
+
 # ---- 核心：处理一条事件 ----
 # $1 = 事件 JSON（im.message.receive_v1 的字段，已在 consume 的 jq 阶段 select 过本群）
 process_event() {
@@ -1492,24 +1580,42 @@ process_event() {
     return
   fi
 
-  # 遍历所有日志ID，每条独立跑完整链路（resolve_trace_ids → 解密 → LLM 分析 → 回复）。
-  # 多 ID 场景共享同一 event_started_epoch（即 1 小时总预算按消息整体计），单条失败不中断其他条。
   local total_ids
   total_ids=$(echo "$log_ids" | wc -l | tr -d ' ')
   log "抽取到日志ID: $(echo "$log_ids" | tr '\n' ' ')（共 ${total_ids} 条）"
-  if (( total_ids > 1 )); then
-    log "该消息含 ${total_ids} 条日志ID，将逐条独立分析"
+
+  # --once 调试模式：同步跑完（跑一条就退出，无需后台化，便于观察完整输出）。
+  if [[ -n "$ONLY_MSG_ID" ]]; then
+    (( total_ids > 1 )) && log "该消息含 ${total_ids} 条日志ID，将逐条独立分析"
+    local log_id idx=0
+    while IFS= read -r log_id; do
+      [[ -z "$log_id" ]] && continue
+      idx=$((idx + 1))
+      (( total_ids > 1 )) && log "处理第 ${idx}/${total_ids} 条日志ID: $log_id"
+      analyze_one_log_id "$log_id" "$content" "$msg_id" "$root_msg_id" "$event_started_epoch" \
+        || log "日志ID $log_id 处理失败，继续下一条"
+    done <<< "$log_ids"
+    return
   fi
-  local log_id idx=0
-  while IFS= read -r log_id; do
-    [[ -z "$log_id" ]] && continue
-    idx=$((idx + 1))
-    if (( total_ids > 1 )); then
-      log "处理第 ${idx}/${total_ids} 条日志ID: $log_id"
-    fi
-    # 单条失败不中断其他条
-    analyze_one_log_id "$log_id" "$content" "$msg_id" "$root_msg_id" "$event_started_epoch" || log "日志ID $log_id 处理失败，继续下一条"
-  done <<< "$log_ids"
+
+  # 常驻模式：后台派活，主循环立即返回继续消费事件。同一消息的多日志ID在同一个
+  # 后台子进程里串行（保持 1h 总预算语义）；不同消息的分析并行，受 MAX_CONCURRENT_ANALYSIS 限制。
+  # 幂等：先 mark_processed（事件已接收），避免同事件重复派活；分析失败由启动恢复兜底。
+  mark_processed "$msg_id"
+  # 持久化任务（供 kill 后启动恢复，改动3）
+  analysis_task_write "$msg_id" "$content" "$root_msg_id" "$log_ids" "$event_started_epoch"
+  # 并发控制：达到上限时阻塞等待空位（消息已在 FIFO 排队，这里短暂等待不影响后续消费）
+  local waited=0
+  while [[ $(count_active_analysis) -ge $MAX_CONCURRENT_ANALYSIS ]]; do
+    (( waited == 0 )) && log "已达并发上限 ${MAX_CONCURRENT_ANALYSIS}，$msg_id 排队等待空位"
+    waited=1
+    sleep 5
+  done
+  (( waited == 1 )) && log "获得空位，开始后台分析 $msg_id"
+  run_analysis_background "$log_ids" "$content" "$msg_id" "$root_msg_id" "$event_started_epoch"
+  local bg_pid=$!
+  analysis_pid_track "$msg_id" "$bg_pid"
+  log "已派活后台分析 $msg_id (pid=$bg_pid)，主循环继续监听"
 }
 
 # ---- 调试模式：单条 ----
@@ -1549,6 +1655,8 @@ if [[ -n "$ONLY_AUTOFIX_TASK_ID" ]]; then
 fi
 
 # ---- 常驻：event consume 主循环 ----
+# 仅常驻模式需要单实例锁（防两个 consumer 抢订阅）。--once/--once-autofix 已在前面 exit。
+acquire_singleton_lock
 log "===== 启动 badcase 事件订阅 daemon (chat=$CHAT_ID, dry_reply=$DRY_REPLY) ====="
 log "状态目录与 trace 缓存已初始化"
 # autofix：启动时先扫一遍超时（daemon 重启后补做上一轮挂起的审批超时清理）
@@ -1566,6 +1674,27 @@ if (( AUTOFIX_ENABLED == 1 )); then
     ( autofix_run_review "$tid" || log "autofix: 恢复 review 失败 task=$tid rc=$?" ) >>"$LOG_FILE" 2>&1 &
   done
 fi
+# 恢复中断的分析任务：daemon 上次被 kill 时，正在后台分析的 case 任务文件会残留
+# （analyze 链路中途断了，没走到 analysis_task_remove）。重新派活后台分析续上，不丢失。
+# 已在 processed 账本里的才恢复（避免重投）；并发受 MAX_CONCURRENT_ANALYSIS 限制。
+local _atf
+for _atf in "$ANALYSIS_TASKS_DIR"/task_*.json; do
+  [[ -f "$_atf" ]] || continue
+  local _mid _content _root _lids _epoch
+  _mid=$(jq -r '.message_id // empty' "$_atf" 2>/dev/null)
+  _content=$(jq -r '.content // empty' "$_atf" 2>/dev/null)
+  _root=$(jq -r '.root_msg_id // empty' "$_atf" 2>/dev/null)
+  _lids=$(jq -r '.log_ids // empty' "$_atf" 2>/dev/null)
+  _epoch=$(jq -r '.event_started_epoch // 0' "$_atf" 2>/dev/null)
+  [[ -z "$_mid" || -z "$_lids" ]] && { rm -f "$_atf"; continue; }
+  # 已分析超 1 小时的（预算已耗尽）不再恢复，避免重启后跑老到期的任务
+  local _now _elapsed
+  _now=$(date +%s); _elapsed=$(( _now - _epoch ))
+  (( _elapsed > ANALYSIS_TOTAL_TIMEOUT )) && { log "分析任务 $_mid 已超预算(${_elapsed}s)，丢弃"; rm -f "$_atf"; continue; }
+  log "恢复中断的分析任务 $_mid（已用时 ${_elapsed}s）"
+  run_analysis_background "$_lids" "$_content" "$_mid" "$_root" "$_epoch"
+  analysis_pid_track "$_mid" "$!"
+done
 
 # consume 子进程：select 本群，stdout 每行一条事件 NDJSON。
 # --max-events 安全上限到达后退出，由 launchd KeepAlive 重启。
@@ -1611,6 +1740,8 @@ while IFS= read -r line; do
   process_event "$line" || log "处理事件失败，保留未处理状态并继续消费后续事件"
   # autofix：每处理一条事件后扫一遍审批超时（低频兜底清理）
   autofix_check_timeouts || true
+  # 回收已退出的后台分析子进程（防 zombie）
+  reap_analysis_zombies || true
 done <"$FIFO"
 
 # consume 已退出，回收避免僵尸
