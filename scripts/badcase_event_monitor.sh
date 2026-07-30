@@ -130,6 +130,9 @@ AUTOFIX_CONCLUSIONS_FILE="${AUTOFIX_CONCLUSIONS_FILE:-$STATE_DIR/autofix_process
 # autofix 方法论 prompt（注入 zcode）
 AUTOFIX_REVIEW_SKILL="${AUTOFIX_REVIEW_SKILL:-$DAEMON_ROOT/skills/autofix-review/SKILL.md}"
 AUTOFIX_EXECUTE_SKILL="${AUTOFIX_EXECUTE_SKILL:-$DAEMON_ROOT/skills/autofix-execute/SKILL.md}"
+# autofix 专用 git worktree：始终基于 develop 最新，zcode 在此读代码/改代码/提 MR，
+# 完全不影响用户的主工作区（用户可能在别的分支干活）。路径复用仓库已忽略的 .worktrees/。
+AUTOFIX_WORKTREE="${AUTOFIX_WORKTREE:-$REPO_ROOT/.worktrees/autofix}"
 # ============ autofix 配置结束 ============
 # 后台分析并发上限：同一时刻最多并行分析多少条消息（防并发抢爆 bigmodel 配额）。
 # 超出的消息在主循环里暂存，待有空位再派活（任务文件保留，不会丢）。
@@ -258,7 +261,8 @@ run_zcode_session() (
     : >"$tmp"
     : >"$err"
     local -a zcode_args
-    zcode_args=(--prompt "$prompt" --json --cwd "$REPO_ROOT")
+    # cwd 优先用 ZCODE_CWD（autofix review/execute 传隔离 worktree 路径），否则用 REPO_ROOT。
+    zcode_args=(--prompt "$prompt" --json --cwd "${ZCODE_CWD:-$REPO_ROOT}")
     [[ -n "$attachment_path" ]] && zcode_args+=(--attach "$attachment_path")
     ZCODE_MODEL="$ZCODE_MODEL" \
     ZCODE_BASE_URL="$ZCODE_BASE_URL" \
@@ -738,6 +742,29 @@ reply_thread_progress() {
 # 任务 JSON 持久化在 $AUTOFIX_TASKS_DIR，daemon 重启可恢复。
 # ============================================================
 
+# ---- autofix 专用 git worktree（基于 develop 最新，隔离用户主工作区）----
+# 用户的主工作区可能在别的分支干活；autofix 的 review（读代码定位）和 execute（改码提MR）
+# 都在这个隔离 worktree 里做，始终基于 develop 最新，互不干扰。
+# worktree 路径复用仓库已忽略的 .worktrees/，不会污染主工作区。
+ensure_autofix_worktree() {
+  local wt="$AUTOFIX_WORKTREE"
+  # 1. 先在主仓库 fetch 最新 develop（worktree 共享主仓库的 .git，fetch 一次即可）
+  git -C "$REPO_ROOT" fetch origin develop 2>>"$LOG_FILE" || { log "autofix worktree: fetch origin develop 失败"; return 1; }
+  # 2. worktree 不存在 → 基于 origin/develop 创建（detached 会丢失分支跟踪，用 develop 分支）
+  if [[ ! -d "$wt/.git" ]] && ! git -C "$REPO_ROOT" worktree list --porcelain 2>/dev/null | grep -q "^worktree $wt"; then
+    # 防残留空目录导致 add 失败
+    rm -rf "$wt" 2>/dev/null
+    git -C "$REPO_ROOT" worktree add -f "$wt" -B autofix-base origin/develop 2>>"$LOG_FILE" \
+      || { log "autofix worktree: worktree add 失败"; return 1; }
+    log "autofix worktree: 已创建 $wt (基于 origin/develop)"
+  fi
+  # 3. 已存在 → 强制同步到 develop 最新。这是专用 worktree，可以安全丢弃上次 execute 的残留
+  #    （上次的 fix 分支改动要么已 push 提 MR、要么废弃，都不需保留）。
+  git -C "$wt" switch -C autofix-base origin/develop 2>>"$LOG_FILE" \
+    || { log "autofix worktree: 同步到 develop 失败"; return 1; }
+  echo "$wt"
+}
+
 # ---- 任务 JSON 读写（用 jq 保证转义安全）----
 # task 字段：task_id, state, root_om, thread_root_om, trace_id, trace_dir,
 #   run_log_id, conclusion_md, reported_by, complexity, root_cause, fix_plan,
@@ -878,6 +905,16 @@ $trace_details_file
 
   # 调 zcode（复用其重试/退避外壳，但 review 是独立预算）。不传附件：trace 路径已写进
   # prompt，模型按需 Read；避免大文件 --attach 超限。
+  # 用隔离 worktree（基于 develop 最新）作为 zcode cwd，确保读的代码是 develop 最新、
+  # 不受用户主工作区当前分支影响。ensure 失败时降级用 REPO_ROOT（不阻断，但日志告警）。
+  local review_wt
+  if review_wt=$(ensure_autofix_worktree); then
+    ZCODE_CWD="$review_wt"
+    log "autofix: review 用 worktree（develop 最新）: $review_wt"
+  else
+    ZCODE_CWD="$REPO_ROOT"
+    log "autofix: ⚠️ worktree 不可用，review 降级用主仓库 $REPO_ROOT（可能非 develop 最新）"
+  fi
   local now deadline response
   now=$(date +%s); deadline=$(( now + AUTOFIX_REVIEW_TIMEOUT ))
   response=$(run_zcode_session "$review_prompt" "$deadline" "$AUTOFIX_REVIEW_ATTEMPT_TIMEOUT" "" "复核" 0 "")
@@ -1045,7 +1082,9 @@ autofix_execute() {
   security_skill=$(cat "$REPO_ROOT/.agents/skills/data-security-review/SKILL.md" 2>/dev/null)
 
   local exec_prompt
-  exec_prompt="你是多维表格智能体的自动修复执行 agent。审批已通过，请严格按修改计划完成代码修改并提交合并到 develop 的 MR。工作目录即 bitable-chatbot 仓库根。
+  exec_prompt="你是多维表格智能体的自动修复执行 agent。审批已通过，请严格按修改计划完成代码修改并提交合并到 develop 的 MR。
+
+重要：你的工作目录已经是一个**基于 develop 最新的隔离 worktree**（git 操作都在这里，无需先 git switch develop / git pull，worktree 已是 develop 最新）。直接从当前状态切 fix 分支开始改即可。
 
 === 执行方法论（autofix-execute skill）===
 $skill_execute
@@ -1071,6 +1110,15 @@ trace_id: $trace_id
 
 请按执行方法论步骤 1-8 完成，并输出 EXEC_STATUS / MR_NUMBER / MR_URL / BRANCH / COMMIT（或失败原因）控制行。注意：MR base 必须是 develop，分支名用 fix-autofix-$(echo "$trace_id" | cut -c1-8)。"
 
+  # 用隔离 worktree（已同步到 develop 最新）作为 zcode cwd，确保改码基于最新 develop。
+  # execute 失败必须转人工（不能降级到可能非最新的主仓库去改码）。
+  local exec_wt
+  if ! exec_wt=$(ensure_autofix_worktree); then
+    autofix_finalize_failed "$task_id" "无法准备 develop 最新 worktree，转人工（git fetch/sync 失败）"
+    return 1
+  fi
+  ZCODE_CWD="$exec_wt"
+  log "autofix: execute 用 worktree（develop 最新）: $exec_wt"
   local now deadline response
   now=$(date +%s); deadline=$(( now + AUTOFIX_EXECUTE_TIMEOUT ))
   response=$(run_zcode_session "$exec_prompt" "$deadline" "$AUTOFIX_EXECUTE_ATTEMPT_TIMEOUT" "" "执行" 0)

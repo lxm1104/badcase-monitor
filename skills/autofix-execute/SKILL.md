@@ -11,18 +11,17 @@
 
 ## 工作步骤（按顺序，不要跳步）
 
-### 步骤 1：确保从 develop 干净出发
+### 步骤 1：从 worktree 当前状态切 fix 分支
+
+你的工作目录已经是 daemon 预先准备好的**隔离 worktree，基于 develop 最新**（daemon 已 fetch + 同步好）。
+**不要**再执行 `git switch develop` 或 `git pull`——worktree 当前就是 develop 最新状态。直接切 fix 分支：
 
 ```bash
-cd <仓库根>
-git status --short --branch          # 先看是否有未提交改动
-git switch develop                   # 切到 develop
-git pull --ff-only origin develop 2>/dev/null || true   # 拉最新（失败不阻断）
 git switch -c fix-autofix-<trace_id短>   # 短横线命名，不带 slash
 ```
 
-- 若工作区有他人无关改动：**不要回滚、不要一起提交**，只在你的新分支上改本次任务文件。
 - 分支名用 `fix-autofix-<trace前8位>`，简短可识别。
+- worktree 是专用的，里面不会有他人改动，无需担心脏工作区。
 
 ### 步骤 2：按修改计划（+ 讨论结果）改代码
 
