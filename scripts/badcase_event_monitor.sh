@@ -956,19 +956,30 @@ autofix_check_approval_reply() {
   local tasks; tasks=$(autofix_tasks_in_state "awaiting_approval")
   [[ -z "$tasks" ]] && return 1
 
-  # 一次 mget 拿到本消息的 root_id（判断归属哪个 thread）和发送者名字（记录讨论用）。
+  # 一次 mget 拿到本消息的 thread_id（判断归属哪个 thread）和发送者名字（记录讨论用）。
   # 事件订阅的 sender_id 只有 open_id 无名字；mget 能补 sender.name。
-  local mget_json mget_root sender_name
+  # 注意：话题群（THREAD）的回复消息 mget 不返回 root_id/parent_id，只有 thread_id(omt_)。
+  # 因此归属判断必须用 thread_id，不能用 root_id。
+  local mget_json msg_thread_id sender_name
   mget_json=$(lark-cli im +messages-mget --message-ids "$msg_id" --as user --no-reactions --json 2>/dev/null || true)
-  mget_root=$(echo "$mget_json" | jq -r '.data.messages[0].root_id // .data.messages[0].parent_id // empty' 2>/dev/null || true)
+  msg_thread_id=$(echo "$mget_json" | jq -r '.data.messages[0].thread_id // empty' 2>/dev/null || true)
   sender_name=$(echo "$mget_json" | jq -r '.data.messages[0].sender.name // .data.messages[0].sender.sender_id // "未知"' 2>/dev/null || echo "未知")
 
   local tid
   for tid in $tasks; do
     local root_om; root_om=$(autofix_task_get "$tid" '.root_om')
     [[ -z "$root_om" ]] && continue
-    # 本消息属于该 thread：root_id 匹配，或 msg_id 本身就是 case 根消息
-    [[ "$mget_root" == "$root_om" || "$msg_id" == "$root_om" ]] || continue
+    # 本消息是否属于该任务的 thread：比对 thread_id。任务存的是 root_om（om_），
+    # 需取其 thread_id；任务 JSON 有缓存 task_thread_id 时直接用，否则拉一次根消息取。
+    local task_thread_id
+    task_thread_id=$(autofix_task_get "$tid" '.task_thread_id // empty')
+    if [[ -z "$task_thread_id" ]]; then
+      task_thread_id=$(lark-cli im +messages-mget --message-ids "$root_om" --as user --no-reactions --json 2>/dev/null \
+        | jq -r '.data.messages[0].thread_id // empty' 2>/dev/null || true)
+      [[ -n "$task_thread_id" ]] && autofix_task_set "$tid" --arg ttid "$task_thread_id" '.task_thread_id=$ttid'
+    fi
+    # 归属命中：thread_id 相同，或本消息就是 case 根消息本身
+    [[ -n "$msg_thread_id" && "$msg_thread_id" == "$task_thread_id" ]] || [[ "$msg_id" == "$root_om" ]] || continue
 
     # 是审批人（刘昕明）的回复 → 判同意/反对
     if [[ -n "$sender_id" && "$sender_id" == "$AUTOFIX_REVIEWER_OPEN_ID" ]]; then
