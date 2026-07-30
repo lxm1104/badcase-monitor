@@ -749,18 +749,20 @@ reply_thread_progress() {
 ensure_autofix_worktree() {
   local wt="$AUTOFIX_WORKTREE"
   # 1. 先在主仓库 fetch 最新 develop（worktree 共享主仓库的 .git，fetch 一次即可）
-  git -C "$REPO_ROOT" fetch origin develop 2>>"$LOG_FILE" || { log "autofix worktree: fetch origin develop 失败"; return 1; }
-  # 2. worktree 不存在 → 基于 origin/develop 创建（detached 会丢失分支跟踪，用 develop 分支）
+  git -C "$REPO_ROOT" fetch origin develop >>"$LOG_FILE" 2>&1 || { log "autofix worktree: fetch origin develop 失败"; return 1; }
+  # 2. worktree 不存在 → 基于 origin/develop 创建
   if [[ ! -d "$wt/.git" ]] && ! git -C "$REPO_ROOT" worktree list --porcelain 2>/dev/null | grep -q "^worktree $wt"; then
     # 防残留空目录导致 add 失败
     rm -rf "$wt" 2>/dev/null
-    git -C "$REPO_ROOT" worktree add -f "$wt" -B autofix-base origin/develop 2>>"$LOG_FILE" \
+    git -C "$REPO_ROOT" worktree add -f "$wt" -B autofix-base origin/develop >>"$LOG_FILE" 2>&1 \
       || { log "autofix worktree: worktree add 失败"; return 1; }
     log "autofix worktree: 已创建 $wt (基于 origin/develop)"
   fi
   # 3. 已存在 → 强制同步到 develop 最新。这是专用 worktree，可以安全丢弃上次 execute 的残留
   #    （上次的 fix 分支改动要么已 push 提 MR、要么废弃，都不需保留）。
-  git -C "$wt" switch -C autofix-base origin/develop 2>>"$LOG_FILE" \
+  # 重要：git 的 "branch 'xxx' set up to track" 这类提示输出到 stdout，必须连同 stdout 一起
+  # 重定向到日志，否则会污染函数返回值（ZCODE_CWD 拿到垃圾路径导致 zcode cwd 不可用）。
+  git -C "$wt" switch -C autofix-base origin/develop >>"$LOG_FILE" 2>&1 \
     || { log "autofix worktree: 同步到 develop 失败"; return 1; }
   echo "$wt"
 }
