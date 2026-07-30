@@ -1,9 +1,15 @@
 #!/usr/bin/env bash
-# Badcase 群事件订阅常驻分析 Daemon
+# Badcase 群事件订阅常驻分析 Daemon（含 autofix 自动修复）
 #
 # 通过 lark-cli event consume（WebSocket 长连接）实时接收 badcase 群所有新消息，
 # 自动抽取消息中的日志 ID（run_log_id），跑完整链路：
 #   抽 ID → 查 trace_id → 抓 trace → 解密（全自动 @板栗）→ LLM 根因分析 → bot 自动回复到 thread
+#
+# autofix 自动修复模块（在本结论帖发出后自动启动，状态机见脚本中段）：
+#   结论帖 → 独立复核根因(复用 trace 缓存) → 评估复杂度 →
+#   简单可自动改(≤3文件无外部库)则发修改计划到 thread → 等刘昕明显式同意 →
+#   zcode 全自动切 develop → 改 → 提 MR → 把 MR 链接发回 thread 请人 review。
+#   审批复用本主循环（刘昕明回复即推进），72h 超时挂起。thread 内讨论作为修改依据。
 #
 # 与 feishu_feedback_monitor.sh 的根本差异：
 #   - 那是「轮询 one-shot」（StartInterval 触发，每次拉增量后退出）
@@ -15,6 +21,7 @@
 #   ./badcase_event_monitor.sh --once <om_xxx>  # 调试：只处理一条已知 message_id（需能从事件或拉取取到）
 #   ./badcase_event_monitor.sh --once <om_xxx> --log-id <id>  # 历史合并转发正文已过期时，用已核验 ID 重放
 #   ./badcase_event_monitor.sh --dry-reply      # 全链路跑但不实际回复（回复前 dry-run）
+#   ./badcase_event_monitor.sh --once-autofix <task_id> [review|execute]  # 调试：重放某 autofix 任务阶段
 set -euo pipefail
 # trace、模型临时响应和幂等账本都只允许当前用户访问；子进程继承该 umask。
 umask 077
@@ -98,11 +105,37 @@ PID_FILE="$STATE_DIR/badcase_event_monitor.pid"
 CONSUME_MAX_EVENTS="${CONSUME_MAX_EVENTS:-1000}"
 # 单次 trace 解密等待板栗审批的最长时间（秒）
 DECRYPT_WAIT_TIMEOUT="${DECRYPT_WAIT_TIMEOUT:-900}"
+
+# ============ autofix 自动修复模块配置 ============
+# 在结论帖发出后，独立复核根因、评估复杂度，对「简单可自动改」的 case 给出修改计划，
+# 等刘昕明显式同意后由 zcode headless 全自动切 develop → 改 → 提 MR。详见下方状态机。
+AUTOFIX_ENABLED="${AUTOFIX_ENABLED:-1}"
+# 审批人（刘昕明）的飞书 open_id（ou_xxx）。留空则启动时从本机登录者身份自动取。
+AUTOFIX_REVIEWER_OPEN_ID="${AUTOFIX_REVIEWER_OPEN_ID:-}"
+# 审批等待时长（秒）：发出修改计划后多久没等到同意就挂起。默认 72 小时。
+AUTOFIX_APPROVAL_TIMEOUT="${AUTOFIX_APPROVAL_TIMEOUT:-259200}"
+# 可自动修复的文件数上限：超过即判为 MANUAL（转人工）。
+AUTOFIX_MAX_FILES="${AUTOFIX_MAX_FILES:-3}"
+# review（独立复核+复杂度评估）阶段总预算（秒）
+AUTOFIX_REVIEW_TIMEOUT="${AUTOFIX_REVIEW_TIMEOUT:-1200}"
+# review 单轮 zcode 超时上限（秒）
+AUTOFIX_REVIEW_ATTEMPT_TIMEOUT="${AUTOFIX_REVIEW_ATTEMPT_TIMEOUT:-900}"
+# 执行（改码+提MR）阶段总预算（秒）
+AUTOFIX_EXECUTE_TIMEOUT="${AUTOFIX_EXECUTE_TIMEOUT:-1800}"
+# 执行阶段单轮 zcode 超时上限（秒）
+AUTOFIX_EXECUTE_ATTEMPT_TIMEOUT="${AUTOFIX_EXECUTE_ATTEMPT_TIMEOUT:-1500}"
+# 任务持久化目录与结论帖幂等账本
+AUTOFIX_TASKS_DIR="${AUTOFIX_TASKS_DIR:-$STATE_DIR/autofix_tasks}"
+AUTOFIX_CONCLUSIONS_FILE="${AUTOFIX_CONCLUSIONS_FILE:-$STATE_DIR/autofix_processed_conclusions.txt}"
+# autofix 方法论 prompt（注入 zcode）
+AUTOFIX_REVIEW_SKILL="${AUTOFIX_REVIEW_SKILL:-$DAEMON_ROOT/skills/autofix-review/SKILL.md}"
+AUTOFIX_EXECUTE_SKILL="${AUTOFIX_EXECUTE_SKILL:-$DAEMON_ROOT/skills/autofix-execute/SKILL.md}"
+# ============ autofix 配置结束 ============
 # ============ 配置结束 ============
 
-mkdir -p "$STATE_DIR" "$(dirname "$LOG_FILE")" "$STATE_DIR/traces"
+mkdir -p "$STATE_DIR" "$(dirname "$LOG_FILE")" "$STATE_DIR/traces" "$AUTOFIX_TASKS_DIR"
 chmod 700 "$STATE_DIR" 2>/dev/null || true
-touch "$PROCESSED_FILE"
+touch "$PROCESSED_FILE" "$AUTOFIX_CONCLUSIONS_FILE"
 
 log() { echo "[$(date '+%Y-%m-%d %H:%M:%S')] $*" | tee -a "$LOG_FILE" >&2; }
 die() { log "ERROR: $*"; exit 1; }
@@ -118,6 +151,23 @@ command -v uuidgen >/dev/null || die "uuidgen 不在 PATH"
 [[ -d "$FORNAX_SCRIPTS" ]] || die "fornax-trace-fetch 脚本目录不存在: $FORNAX_SCRIPTS"
 [[ -f "$FIND_RUNLOG" ]] || die "find-runlog-log.sh 不存在: $FIND_RUNLOG"
 [[ -f "$TRACE_ANALYZE_SKILL" ]] || die "trace-decrypt-analyze SKILL.md 不存在: $TRACE_ANALYZE_SKILL"
+# autofix 模块依赖（仅在启用时强校验，避免禁用 autofix 时因缺 git/go/SKILL 阻止 daemon 启动）
+if [[ "$AUTOFIX_ENABLED" == "1" ]]; then
+  command -v git >/dev/null || die "autofix 启用：git 不在 PATH"
+  command -v go >/dev/null || die "autofix 启用：go 不在 PATH"
+  [[ -f "$AUTOFIX_REVIEW_SKILL" ]] || die "autofix 启用：autofix-review SKILL.md 不存在: $AUTOFIX_REVIEW_SKILL"
+  [[ -f "$AUTOFIX_EXECUTE_SKILL" ]] || die "autofix 启用：autofix-execute SKILL.md 不存在: $AUTOFIX_EXECUTE_SKILL"
+  # 审批人 open_id（刘昕明）：留空时从本机登录者自动取（本机登录者即「我」）。
+  if [[ -z "$AUTOFIX_REVIEWER_OPEN_ID" ]]; then
+    AUTOFIX_REVIEWER_OPEN_ID=$(LARKSUITE_CLI_NO_UPDATE_NOTIFIER=1 LARKSUITE_CLI_NO_SKILLS_NOTIFIER=1 \
+      lark-cli auth status --json --verify 2>/dev/null \
+      | jq -r '.identities.user.openId // empty' 2>/dev/null || true)
+    if [[ -z "$AUTOFIX_REVIEWER_OPEN_ID" ]]; then
+      die "autofix 启用：无法自动取审批人 open_id，请在 ~/.badcase_event_env 设置 AUTOFIX_REVIEWER_OPEN_ID"
+    fi
+    log "autofix 审批人 open_id 取自本机登录者: $AUTOFIX_REVIEWER_OPEN_ID"
+  fi
+fi
 
 # 单实例锁：两个 consumer 订阅同一 EventKey 会报 "subscription already exists" 并重复投递。
 # macOS 无 flock，用自带的 shlock（原子写 pid 文件；若文件已存在且 pid 存活则失败）。
@@ -137,11 +187,15 @@ trap 'rm -f "$PID_FILE"' EXIT
 DRY_REPLY=0
 ONLY_MSG_ID=""
 FORCED_LOG_ID=""
+ONLY_AUTOFIX_TASK_ID=""
+ONLY_AUTOFIX_PHASE=""
 while [[ $# -gt 0 ]]; do
   case "$1" in
     --dry-reply) DRY_REPLY=1; shift ;;
     --once) ONLY_MSG_ID="${2:-}"; shift 2 ;;
     --log-id) FORCED_LOG_ID="${2:-}"; shift 2 ;;
+    # 调试：单任务重放 autofix 的某个阶段。phase ∈ review|execute
+    --once-autofix) ONLY_AUTOFIX_TASK_ID="${2:-}"; ONLY_AUTOFIX_PHASE="${3:-review}"; shift 3 ;;
     -h|--help)
       sed -n '2,20p' "$0"; exit 0 ;;
     *) die "未知参数: $1" ;;
@@ -664,6 +718,394 @@ reply_thread_progress() {
   return 0
 }
 
+# ============================================================
+# ===== autofix 自动修复模块：状态机 + 任务持久化 ==========
+# 状态机：reviewing → awaiting_approval → executing → done/failed
+# 所有耗时阶段（review/execute）在后台子进程跑，不阻塞主循环消费事件。
+# 审批检测复用主循环：刘昕明在 thread 的回复会作为普通消息被 consume 推过来，
+# process_event 顶部调 autofix_check_approval_reply 推进状态。
+# 任务 JSON 持久化在 $AUTOFIX_TASKS_DIR，daemon 重启可恢复。
+# ============================================================
+
+# ---- 任务 JSON 读写（用 jq 保证转义安全）----
+# task 字段：task_id, state, root_om, thread_root_om, trace_id, trace_dir,
+#   run_log_id, conclusion_md, reported_by, complexity, root_cause, fix_plan,
+#   plan_msg_om, created_epoch, approved_epoch, mr_url, mr_number, branch, commit_hash,
+#   discussion_context(数组), failures, last_error
+# task_id 用 trace_id 派生（同一 trace 只建一个修复任务）
+
+# 生成/取任务文件路径。$1 = task_id
+autofix_task_file() { echo "$AUTOFIX_TASKS_DIR/task_$1.json"; }
+
+# 读取任务字段。$1=task_id $2=jq 路径
+autofix_task_get() { local f; f=$(autofix_task_file "$1"); jq -r "$2 // empty" "$f" 2>/dev/null; }
+
+# 写入任务字段。$1=task_id $2=jq 赋值表达式(如 '.state="done"')
+autofix_task_set() {
+  local task_id="$1" assign="$2"
+  local f; f=$(autofix_task_file "$task_id")
+  local tmp="$f.tmp"
+  jq "$assign" "$f" >"$tmp" 2>/dev/null && mv "$tmp" "$f" || { log "autofix_task_set 失败 task=$task_id assign=$assign"; rm -f "$tmp"; }
+}
+
+# 追加讨论上下文（thread 内其他人发言）。$1=task_id $2=sender_name $3=text
+autofix_task_add_discussion() {
+  local task_id="$1" sender="$2" text="$3"
+  local f; f=$(autofix_task_file "$task_id")
+  [[ -f "$f" ]] || return 0
+  local tmp="$f.tmp"
+  # 用 jq 安全拼接（text 可能含特殊字符）
+  jq --arg s "$sender" --arg t "$text" '.discussion_context += ["\($s): \($t)"]' "$f" >"$tmp" 2>/dev/null && mv "$tmp" "$f" || rm -f "$tmp"
+}
+
+# 列出所有处于指定状态的任务 id（每行一个）。$1=state（可空=全部）
+autofix_tasks_in_state() {
+  local state="${1:-}"
+  local f
+  for f in "$AUTOFIX_TASKS_DIR"/task_*.json; do
+    [[ -f "$f" ]] || continue
+    local tid st
+    tid=$(jq -r '.task_id // empty' "$f" 2>/dev/null)
+    st=$(jq -r '.state // empty' "$f" 2>/dev/null)
+    [[ -z "$tid" ]] && continue
+    if [[ -z "$state" || "$st" == "$state" ]]; then
+      echo "$tid"
+    fi
+  done
+}
+
+# ---- 触发：结论帖发出后创建 reviewing 任务 ----
+# 在 analyze_one_log_id 的 reply_thread_and_mark 成功后调用。
+# $1=root_om(结论帖回复的目标，即 case 根消息) $2=trace_id $3=trace_dir
+# $4=run_log_id $5=conclusion_md $6=reported_by(报案人名，可空)
+autofix_on_conclusion_posted() {
+  (( AUTOFIX_ENABLED == 1 )) || return 0
+  local root_om="$1" trace_id="$2" trace_dir="$3" run_log_id="$4" conclusion_md="$5" reported_by="${6:-}"
+  [[ -n "$trace_id" && -n "$trace_dir" && -n "$root_om" ]] || return 0
+  # 幂等：同一 trace 已建过任务则不重复
+  local task_id="trace_${trace_id}"
+  local f; f=$(autofix_task_file "$task_id")
+  [[ -f "$f" ]] && { log "autofix: trace $trace_id 已有任务，跳过"; return 0; }
+  # 结论帖幂等账本（防 daemon 重启后重复触发）
+  grep -qxF "$root_om:$trace_id" "$AUTOFIX_CONCLUSIONS_FILE" 2>/dev/null && { log "autofix: 结论 $root_om:$trace_id 已触发过"; return 0; }
+
+  # 创建任务 JSON（用 jq from 模板，保证合法）
+  local now; now=$(date +%s)
+  jq -n \
+    --arg tid "$task_id" --arg st "reviewing" --arg root "$root_om" \
+    --arg tid2 "$trace_id" --arg tdir "$trace_dir" --arg rlid "$run_log_id" \
+    --arg conc "$conclusion_md" --arg rb "$reported_by" --argjson now "$now" \
+    '{task_id:$tid,state:$st,root_om:$root,trace_id:$tid2,trace_dir:$tdir,run_log_id:$rlid,
+      conclusion_md:$conc,reported_by:$rb,complexity:"",root_cause:"",fix_plan:"",
+      plan_msg_om:"",created_epoch:$now,approved_epoch:0,mr_url:"",mr_number:"",
+      branch:"",commit_hash:"",discussion_context:[],failures:0,last_error:""}' >"$f" 2>/dev/null
+  if [[ ! -s "$f" ]]; then log "autofix: 创建任务 JSON 失败 trace=$trace_id"; rm -f "$f"; return 1; fi
+  echo "$root_om:$trace_id" >>"$AUTOFIX_CONCLUSIONS_FILE"
+  log "autofix: 触发 review 任务 task=$task_id trace=$trace_id (后台启动)"
+
+  # 后台异步跑 review（子 shell，不阻塞主循环；失败只记日志不抛出）
+  (
+    autofix_run_review "$task_id" || log "autofix: review 失败 task=$task_id rc=$?"
+  ) >>"$LOG_FILE" 2>&1 &
+}
+
+# ---- review 阶段：zcode 独立复核 + 复杂度评估 ----
+# $1=task_id
+autofix_run_review() {
+  local task_id="$1"
+  local root_om trace_id trace_dir run_log_id conclusion_md reported_by
+  root_om=$(autofix_task_get "$task_id" '.root_om')
+  trace_id=$(autofix_task_get "$task_id" '.trace_id')
+  trace_dir=$(autofix_task_get "$task_id" '.trace_dir')
+  run_log_id=$(autofix_task_get "$task_id" '.run_log_id')
+  conclusion_md=$(autofix_task_get "$task_id" '.conclusion_md')
+  reported_by=$(autofix_task_get "$task_id" '.reported_by')
+  [[ -d "$trace_dir" ]] || { log "autofix: trace_dir 不存在 $trace_dir"; autofix_finalize_manual "$task_id" "trace 缓存目录丢失，无法复核"; return 1; }
+
+  local skill_methodology span_summary trace_catalog trace_details_file
+  trace_details_file="$trace_dir/trace_details.json"
+  skill_methodology=$(cat "$AUTOFIX_REVIEW_SKILL" 2>/dev/null)
+  span_summary=$(cat "$trace_dir/span_summary.tsv" 2>/dev/null | head -100)
+  trace_catalog=$(build_trace_catalog "$trace_details_file" 2>/dev/null)
+
+  # 证据附件：把 trace 完整明细作为附件，让模型可下钻核对
+  local evidence_bundle="$trace_dir/evidence_bundle.json"
+  build_trace_evidence_bundle "$trace_details_file" "$evidence_bundle" 2>/dev/null || evidence_bundle="$trace_details_file"
+
+  local review_prompt
+  review_prompt="你是多维表格智能体的自动修复 review agent。下面给你一套独立复核与复杂度评估方法论，请严格按它工作。你工作目录就是 bitable-chatbot 仓库根，可以读代码、grep、glob 来亲自定位根因。
+
+=== 独立复核与复杂度评估方法论（autofix-review skill）===
+$skill_methodology
+
+=== 用户原始诉求 / badcase 群消息上下文 ===
+（结论帖内容）
+$conclusion_md
+
+=== run_log_id ===
+$run_log_id
+=== trace_id ===
+$trace_id
+
+=== 完整 span 目录 ===
+$trace_catalog
+
+=== 完整 span 表 ===
+$span_summary
+
+=== 完整 trace 明细已作为附件提供，可下钻核对 span input/output ===
+
+请按方法论步骤 1-5 和输出契约，给出你的独立复核结论、复杂度判定（COMPLEXITY 行）和（若 SIMPLE_AUTO）修改计划（FIX_PLAN 段落）。务必逐行精确包含控制行。"
+
+  # 调 zcode（复用其重试/退避外壳，但 review 是独立预算）
+  local now deadline response
+  now=$(date +%s); deadline=$(( now + AUTOFIX_REVIEW_TIMEOUT ))
+  response=$(run_zcode_session "$review_prompt" "$deadline" "$AUTOFIX_REVIEW_ATTEMPT_TIMEOUT" "" "复核" 0 "$evidence_bundle")
+  if [[ -z "$response" ]]; then
+    log "autofix: review zcode 无输出 task=$task_id"
+    autofix_finalize_manual "$task_id" "自动复核未产出结果（模型超时或失败），请人工跟进"
+    return 1
+  fi
+
+  # 解析复杂度
+  local complexity
+  complexity=$(echo "$response" | grep -oE 'COMPLEXITY:[[:space:]]*(SIMPLE_AUTO|MANUAL)' | head -1 | grep -oE 'SIMPLE_AUTO|MANUAL')
+  if [[ "$complexity" != "SIMPLE_AUTO" ]]; then
+    # MANUAL 或解析不到 → 转人工，回复原因
+    local reject_reason
+    reject_reason=$(echo "$response" | grep -oE 'REJECT_REASON:[[:space:]].*' | head -1 | sed -E 's/^REJECT_REASON:[[:space:]]*//')
+    [[ -z "$reject_reason" ]] && reject_reason="复杂度超出自动修复范围，建议人工处理"
+    # 复核正文（去掉控制行）发群
+    local body; body=$(echo "$response" | strip_analysis_control_lines | sed -E '/^COMPLEXITY:|^REJECT_REASON:|^FILES:|^ROOT_CAUSE:/d')
+    autofix_finalize_manual "$task_id" "$reject_reason" "$body"
+    return 0
+  fi
+
+  # SIMPLE_AUTO：解析文件数、根因、计划，发修改计划到 thread
+  local files_cnt root_cause
+  files_cnt=$(echo "$response" | grep -oE 'FILES:[[:space:]]*[0-9]+' | grep -oE '[0-9]+' | head -1)
+  root_cause=$(echo "$response" | grep -oE 'ROOT_CAUSE:[[:space:]].*' | head -1 | sed -E 's/^ROOT_CAUSE:[[:space:]]*//')
+  [[ -z "$files_cnt" ]] && files_cnt="?"
+  # 提取 FIX_PLAN 段落（FIX_PLAN: 之后到结尾或下一个控制行）
+  local fix_plan
+  fix_plan=$(echo "$response" | sed -n '/^FIX_PLAN:/,$p' | sed -E '1s/^FIX_PLAN:[[:space:]]*//' || echo "")
+  [[ -z "$fix_plan" ]] && fix_plan=$(echo "$response" | sed -E '/^(COMPLEXITY|REJECT_REASON|FILES|ROOT_CAUSE):/d' | strip_analysis_control_lines)
+
+  autofix_task_set "$task_id" --arg c "SIMPLE_AUTO" '.complexity=$c'
+  [[ -n "$root_cause" ]] && autofix_task_set "$task_id" --arg rc "$root_cause" '.root_cause=$rc'
+  autofix_task_set "$task_id" --arg fp "$fix_plan" '.fix_plan=$fp'
+
+  # 发修改计划到 thread（bot 身份），等待审批
+  local plan_text
+  printf -v plan_text '**[自动修复·修改计划]** 日志ID \`%s\` / trace \`%s\`（复杂度：可自动改，涉及约 %s 个文件）
+
+%s
+
+---
+_本人（@%s）回复「同意 / 可以 / 赞同 / 批准 / LGTM / 改吧」即开始自动修改并提交 MR；回复反对词则中止。72 小时内无回复将挂起。thread 内的讨论会作为修改依据。_' \
+    "$run_log_id" "$trace_id" "$files_cnt" "$fix_plan" "${reported_by:-报案人}"
+  # dry-reply 模式只预览不发
+  if (( DRY_REPLY == 1 )); then
+    log "[dry-reply] autofix 计划帖预览 task=$task_id（不发送、不转 awaiting）"
+    return 0
+  fi
+  if ! reply_thread "$root_om" "$plan_text" "afplan-${trace_id}"; then
+    log "autofix: 计划帖发送失败 task=$task_id，保留 reviewing 状态供重试"
+    return 1
+  fi
+  autofix_task_set "$task_id" --argjson t "$(date +%s)" '.approved_epoch=0 | .state="awaiting_approval"'
+  log "autofix: 已发修改计划 task=$task_id，进入 awaiting_approval"
+}
+
+# review 判 MANUAL：回复原因并结束任务。$1=task_id $2=原因 $3=复核正文(可空)
+autofix_finalize_manual() {
+  local task_id="$1" reason="$2" body="${3:-}"
+  local root_om; root_om=$(autofix_task_get "$task_id" '.root_om')
+  autofix_task_set "$task_id" --arg r "$reason" '.complexity="MANUAL" | .last_error=$r | .state="done"'
+  local msg
+  printf -v msg '**[自动修复·转人工]** %s%s' "$reason" "${body:+
+
+$body}"
+  (( DRY_REPLY == 0 )) && reply_thread "$root_om" "$msg" "afmanual-${task_id#trace_}" 2>/dev/null || true
+  log "autofix: 任务转人工 task=$task_id reason=$reason"
+}
+
+# ---- 审批检测：在 process_event 顶部调用 ----
+# $1 = 事件 JSON。判断是否落在某 awaiting_approval 任务的 thread 内、是否刘昕明的同意/反对。
+# 也把 thread 内其他人的讨论写进任务 discussion_context。
+# 返回 0=命中某任务（已处理，process_event 应结束）；返回 1=未命中（继续正常 case 处理）。
+autofix_check_approval_reply() {
+  (( AUTOFIX_ENABLED == 1 )) || return 0
+  local evt="$1"
+  local msg_id sender_id content
+  msg_id=$(echo "$evt" | jq -r '.message_id // empty')
+  sender_id=$(echo "$evt" | jq -r '.sender_id // .sender.sender_id.open_id // .sender.open_id // empty')
+  content=$(echo "$evt" | jq -r '.content // ""')
+  [[ -z "$msg_id" ]] && return 1
+
+  # 没有 awaiting_approval 任务时直接跳过，避免无谓 mget。
+  local tasks; tasks=$(autofix_tasks_in_state "awaiting_approval")
+  [[ -z "$tasks" ]] && return 1
+
+  # 一次 mget 拿到本消息的 root_id（判断归属哪个 thread）和发送者名字（记录讨论用）。
+  # 事件订阅的 sender_id 只有 open_id 无名字；mget 能补 sender.name。
+  local mget_json mget_root sender_name
+  mget_json=$(lark-cli im +messages-mget --message-ids "$msg_id" --as user --no-reactions --json 2>/dev/null || true)
+  mget_root=$(echo "$mget_json" | jq -r '.data.messages[0].root_id // .data.messages[0].parent_id // empty' 2>/dev/null || true)
+  sender_name=$(echo "$mget_json" | jq -r '.data.messages[0].sender.name // .data.messages[0].sender.sender_id // "未知"' 2>/dev/null || echo "未知")
+
+  local tid
+  for tid in $tasks; do
+    local root_om; root_om=$(autofix_task_get "$tid" '.root_om')
+    [[ -z "$root_om" ]] && continue
+    # 本消息属于该 thread：root_id 匹配，或 msg_id 本身就是 case 根消息
+    [[ "$mget_root" == "$root_om" || "$msg_id" == "$root_om" ]] || continue
+
+    # 是审批人（刘昕明）的回复 → 判同意/反对
+    if [[ -n "$sender_id" && "$sender_id" == "$AUTOFIX_REVIEWER_OPEN_ID" ]]; then
+      # 反对词优先（不同意/别改/等等/撤销 等）→ 中止
+      if echo "$content" | grep -qiE '不同意|不要|别改|等等|再想想|停下|撤销|反对|放弃|abort'; then
+        autofix_task_set "$tid" --argjson t "$(date +%s)" '.state="done" | .approved_epoch=0'
+        reply_thread "$root_om" '**[自动修复·已中止]** 收到反对意见，已停止本次自动修改。' "afstop-${tid#trace_}" 2>/dev/null || true
+        log "autofix: 收到反对，中止 task=$tid"
+        return 0
+      fi
+      # 同意词 → 转 executing，后台启动执行
+      if echo "$content" | grep -qE '同意|赞同|赞成|批准|可以改|改吧|LGTM|同意了|确认'; then
+        autofix_task_set "$tid" --argjson t "$(date +%s)" '.approved_epoch=$t | .state="executing"'
+        log "autofix: 收到同意，启动执行 task=$tid"
+        reply_thread "$root_om" "**[自动修复·开始执行]** 收到同意，正在自动修改并提交 MR，请稍候……" "afstart-${tid#trace_}" 2>/dev/null || true
+        ( autofix_execute "$tid" || log "autofix: 执行失败 task=$tid rc=$?" ) >>"$LOG_FILE" 2>&1 &
+        return 0
+      fi
+    fi
+    # 非审批人 / 或审批人但非同意反对词 → 作为讨论上下文记录（执行阶段会遵循）
+    autofix_task_add_discussion "$tid" "$sender_name" "$content"
+    log "autofix: 记录讨论上下文 task=$tid from=$sender_name"
+    return 0
+  done
+  # 未命中任何 awaiting_approval 任务 → 返回非 0，让 process_event 继续走正常 case 处理
+  return 1
+}
+
+# ---- 执行阶段：zcode 全自动改码 + 提 MR ----
+# $1=task_id
+autofix_execute() {
+  local task_id="$1"
+  local root_om trace_id run_log_id root_cause fix_plan reported_by
+  root_om=$(autofix_task_get "$task_id" '.root_om')
+  trace_id=$(autofix_task_get "$task_id" '.trace_id')
+  run_log_id=$(autofix_task_get "$task_id" '.run_log_id')
+  root_cause=$(autofix_task_get "$task_id" '.root_cause')
+  fix_plan=$(autofix_task_get "$task_id" '.fix_plan')
+  reported_by=$(autofix_task_get "$task_id" '.reported_by')
+  # 讨论上下文（数组拼接成文本）
+  local discussion
+  discussion=$(autofix_task_get "$task_id" '.discussion_context | map("- " + .) | join("\n")')
+
+  local skill_execute submit_mr_skill security_skill
+  skill_execute=$(cat "$AUTOFIX_EXECUTE_SKILL" 2>/dev/null)
+  submit_mr_skill=$(cat "$REPO_ROOT/.agents/skills/chatbot-submit-mr/SKILL.md" 2>/dev/null)
+  security_skill=$(cat "$REPO_ROOT/.agents/skills/data-security-review/SKILL.md" 2>/dev/null)
+
+  local exec_prompt
+  exec_prompt="你是多维表格智能体的自动修复执行 agent。审批已通过，请严格按修改计划完成代码修改并提交合并到 develop 的 MR。工作目录即 bitable-chatbot 仓库根。
+
+=== 执行方法论（autofix-execute skill）===
+$skill_execute
+
+=== 提 MR 标准流程（chatbot-submit-mr skill，权威约束）===
+$submit_mr_skill
+
+=== 数据安全 review 方法论（data-security-review skill）===
+$security_skill
+
+=== 根因 ===
+$root_cause
+
+=== 修改计划 ===
+$fix_plan
+
+=== 该 thread 内的讨论（请严格遵循讨论结果）===
+$discussion
+
+=== 关联信息 ===
+run_log_id: $run_log_id
+trace_id: $trace_id
+
+请按执行方法论步骤 1-8 完成，并输出 EXEC_STATUS / MR_NUMBER / MR_URL / BRANCH / COMMIT（或失败原因）控制行。注意：MR base 必须是 develop，分支名用 fix-autofix-$(echo "$trace_id" | cut -c1-8)。"
+
+  local now deadline response
+  now=$(date +%s); deadline=$(( now + AUTOFIX_EXECUTE_TIMEOUT ))
+  response=$(run_zcode_session "$exec_prompt" "$deadline" "$AUTOFIX_EXECUTE_ATTEMPT_TIMEOUT" "" "执行" 0)
+  if [[ -z "$response" ]]; then
+    autofix_finalize_failed "$task_id" "执行未产出结果（超时或失败）"
+    return 1
+  fi
+
+  # 解析结果
+  local status
+  status=$(echo "$response" | grep -oE 'EXEC_STATUS:[[:space:]]*(success|failed|blocked_security)' | grep -oE 'success|failed|blocked_security' | head -1)
+  if [[ "$status" == "success" ]]; then
+    local mr_url mr_number branch commit_hash
+    mr_url=$(echo "$response" | grep -oE 'MR_URL:[[:space:]].*' | head -1 | sed -E 's/^MR_URL:[[:space:]]*//')
+    mr_number=$(echo "$response" | grep -oE 'MR_NUMBER:[[:space:]]*[0-9]+' | grep -oE '[0-9]+' | head -1)
+    branch=$(echo "$response" | grep -oE 'BRANCH:[[:space:]].*' | head -1 | sed -E 's/^BRANCH:[[:space:]]*//')
+    commit_hash=$(echo "$response" | grep -oE 'COMMIT:[[:space:]].*' | head -1 | sed -E 's/^COMMIT:[[:space:]]*//')
+    autofix_task_set "$task_id" --arg u "$mr_url" --arg n "$mr_number" --arg b "$branch" --arg c "$commit_hash" \
+      '.mr_url=$u | .mr_number=$n | .branch=$b | .commit_hash=$c | .state="done"'
+    # mr_url 缺失时兜底显示 MR_NUMBER，避免链接为空
+    local mr_display="$mr_url"
+    [[ -z "$mr_display" ]] && mr_display="（链接缺失，MR 编号：${mr_number:-未知}）"
+    local done_msg
+    printf -v done_msg '**[自动修复·已完成]** 已自动修改并提交 MR。
+
+- MR：%s
+- 分支：%s / commit：%s
+
+@%s 请 review。' "$mr_display" "${branch:-?}" "${commit_hash:-?}" "${reported_by:-报案人}"
+    reply_thread "$root_om" "$done_msg" "afdone-${task_id#trace_}" 2>/dev/null || true
+    log "autofix: 执行完成 task=$task_id mr=$mr_url"
+  else
+    local fail_reason
+    fail_reason=$(echo "$response" | grep -oE 'FAIL_REASON:[[:space:]].*' | head -1 | sed -E 's/^FAIL_REASON:[[:space:]]*//')
+    [[ -z "$fail_reason" ]] && fail_reason=$(echo "$response" | sed -E '/^EXEC_STATUS:/d' | head -5 | tr '\n' ' ')
+    autofix_finalize_failed "$task_id" "$fail_reason"
+  fi
+}
+
+# 执行失败收尾：回复并置 failed。$1=task_id $2=原因
+autofix_finalize_failed() {
+  local task_id="$1" reason="$2"
+  local root_om; root_om=$(autofix_task_get "$task_id" '.root_om')
+  autofix_task_set "$task_id" --arg r "$reason" '.last_error=$r | .state="failed"'
+  local msg
+  printf -v msg '**[自动修复·失败]** %s
+
+本次自动修改未完成，请人工跟进。可重新触发或手动处理。' "$reason"
+  reply_thread "$root_om" "$msg" "affail-${task_id#trace_}" 2>/dev/null || true
+  log "autofix: 任务失败 task=$task_id reason=$reason"
+}
+
+# ---- 超时扫描：主循环每轮 + 启动时调用 ----
+# awaiting_approval 任务超 AUTOFIX_APPROVAL_TIMEOUT 则挂起。
+autofix_check_timeouts() {
+  (( AUTOFIX_ENABLED == 1 )) || return 0
+  local now; now=$(date +%s)
+  local tid
+  for tid in $(autofix_tasks_in_state "awaiting_approval"); do
+    local created root_om
+    created=$(autofix_task_get "$tid" '.created_epoch // 0')
+    root_om=$(autofix_task_get "$tid" '.root_om')
+    local elapsed=$(( now - created ))
+    if (( elapsed > AUTOFIX_APPROVAL_TIMEOUT )); then
+      autofix_task_set "$tid" --argjson t "$now" '.state="done" | .last_error="审批超时挂起"'
+      reply_thread "$root_om" "**[自动修复·审批超时]** 超过 ${AUTOFIX_APPROVAL_TIMEOUT}s 未收到同意，本次自动修复已挂起。如需继续请重新触发。" "aftimeout-${tid#trace_}" 2>/dev/null || true
+      log "autofix: 任务审批超时挂起 task=$tid"
+    fi
+  done
+}
+
 # ---- 核心：单个日志ID 的完整分析链路 ----
 # run_log_id → trace_id → 抓 trace → 解密 → LLM 多轮证据复核 → 回复 整条链路。
 # 一条事件消息里可能含多个日志ID，process_event 会对每个 ID 各调用一次本函数，
@@ -947,6 +1389,16 @@ _正在按上述 span_id 拉取完整 input/output，继续调查。_" "ev${evid
     return 1
   fi
   log "完成处理 $msg_id (trace=$first_trace)"
+
+  # autofix 触发：结论帖发出成功后，启动自动修复流程（复核→计划→审批→改码→MR）。
+  # 仅在 autofix 启用时；trace_dir 复用本次已抓缓存，避免重复抓取。
+  # 报案人名尝试从合并转发正文「发送者:」提取，取不到留空（计划帖用兜底文案）。
+  if (( AUTOFIX_ENABLED == 1 )); then
+    local reported_by=""
+    reported_by=$(echo "$content" | grep -oE '\] [^:]+:' | head -1 | sed -E 's/^\] //; s/:$//' | tr -d ' ' || true)
+    autofix_on_conclusion_posted "$root_msg_id" "$first_trace" "$trace_dir" "$first_log_id" "$conclusion" "$reported_by" || \
+      log "autofix 触发失败 trace=$first_trace（不影响主流程）"
+  fi
 }
 
 # ---- 核心：处理一条事件 ----
@@ -964,6 +1416,15 @@ process_event() {
   [[ -z "$msg_id" ]] && { log "事件缺 message_id，跳过"; return; }
   # 幂等
   if is_processed "$msg_id"; then log "已处理过 ${msg_id}，跳过"; return; fi
+  # autofix 审批检测：若该消息落在某 awaiting_approval 任务的 thread 内，处理审批/讨论，
+  # 命中则标记已处理并结束（不当作新 case 抽日志 ID）。需在 bot 跳过之前，以便捕获
+  # 刘昕明（user）的审批回复和同事们的讨论。
+  if (( AUTOFIX_ENABLED == 1 )) && [[ "$sender_type" != "bot" ]]; then
+    if autofix_check_approval_reply "$evt"; then
+      mark_processed "$msg_id"
+      return
+    fi
+  fi
   # 跳过 bot 自己发的（防自循环）
   [[ "$sender_type" == "bot" ]] && { log "跳过 bot 消息 $msg_id"; mark_processed "$msg_id"; return; }
 
@@ -1042,9 +1503,36 @@ if [[ -n "$ONLY_MSG_ID" ]]; then
   exit 0
 fi
 
+# ---- 调试模式：重放 autofix 单任务的某个阶段 ----
+# 用法: --once-autofix <task_id> [review|execute]
+# 需先存在该任务 JSON（通常由结论帖触发自动生成；也可手造）。
+if [[ -n "$ONLY_AUTOFIX_TASK_ID" ]]; then
+  log "===== 调试模式：autofix ${ONLY_AUTOFIX_PHASE} 重放 task=$ONLY_AUTOFIX_TASK_ID ====="
+  autofix_task_file "$ONLY_AUTOFIX_TASK_ID" >/dev/null
+  local_f=$(autofix_task_file "$ONLY_AUTOFIX_TASK_ID")
+  [[ -f "$local_f" ]] || die "任务文件不存在: $local_f"
+  case "$ONLY_AUTOFIX_PHASE" in
+    review)  autofix_run_review "$ONLY_AUTOFIX_TASK_ID" ;;
+    execute) autofix_execute "$ONLY_AUTOFIX_TASK_ID" ;;
+    *) die "未知 phase: $ONLY_AUTOFIX_PHASE（应为 review 或 execute）" ;;
+  esac
+  log "===== autofix 调试结束 ====="
+  exit 0
+fi
+
 # ---- 常驻：event consume 主循环 ----
 log "===== 启动 badcase 事件订阅 daemon (chat=$CHAT_ID, dry_reply=$DRY_REPLY) ====="
 log "状态目录与 trace 缓存已初始化"
+# autofix：启动时先扫一遍超时（daemon 重启后补做上一轮挂起的审批超时清理）
+autofix_check_timeouts || true
+# 恢复遗留的 reviewing 任务（daemon 在 review 中途崩了，任务卡在 reviewing）：
+# 没有在跑的 review 进程时，重新启动它们。
+if (( AUTOFIX_ENABLED == 1 )); then
+  for tid in $(autofix_tasks_in_state "reviewing"); do
+    log "autofix: 恢复遗留 reviewing 任务 task=$tid"
+    ( autofix_run_review "$tid" || log "autofix: 恢复 review 失败 task=$tid rc=$?" ) >>"$LOG_FILE" 2>&1 &
+  done
+fi
 
 # consume 子进程：select 本群，stdout 每行一条事件 NDJSON。
 # --max-events 安全上限到达后退出，由 launchd KeepAlive 重启。
@@ -1088,6 +1576,8 @@ log "consume 已启动 pid=${CONSUME_PID}"
 while IFS= read -r line; do
   [[ -z "$line" ]] && continue
   process_event "$line" || log "处理事件失败，保留未处理状态并继续消费后续事件"
+  # autofix：每处理一条事件后扫一遍审批超时（低频兜底清理）
+  autofix_check_timeouts || true
 done <"$FIFO"
 
 # consume 已退出，回收避免僵尸
