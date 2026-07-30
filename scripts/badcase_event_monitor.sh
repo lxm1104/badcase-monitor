@@ -1003,9 +1003,6 @@ autofix_check_approval_reply() {
         log "autofix: 收到反对，中止 task=$tid"
         return 0
       fi
-        ( autofix_execute "$tid" || log "autofix: 执行失败 task=$tid rc=$?" ) >>"$LOG_FILE" 2>&1 &
-        return 0
-      fi
     fi
     # 非审批人 / 或审批人但非同意反对词 → 作为讨论上下文记录（执行阶段会遵循）
     autofix_task_add_discussion "$tid" "$sender_name" "$content"
