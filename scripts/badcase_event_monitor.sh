@@ -818,7 +818,8 @@ autofix_run_review() {
   # 记录 review 进程 pid，供启动恢复逻辑判断"是否已有 review 在跑"，避免重复启动。
   # 注意：review 在 `( autofix_run_review ) &` 子 shell 里跑，bash 的 $$ 在子 shell 仍是
   # 父 pid，必须用 $BASHPID 才是子 shell 真实 pid（恢复时 kill -0 校验它）。
-  autofix_task_set "$task_id" --argjson rpid "$BASHPID" '.review_pid=$rpid'
+  # macOS bash 3.2 下 BASHPID 在 set -u 的某些路径可能未设置，用 ${BASHPID:-$$} 兜底。
+  autofix_task_set "$task_id" --argjson rpid "${BASHPID:-$$}" '.review_pid=$rpid'
   local root_om trace_id trace_dir run_log_id conclusion_md reported_by
   root_om=$(autofix_task_get "$task_id" '.root_om')
   trace_id=$(autofix_task_get "$task_id" '.trace_id')
