@@ -1298,6 +1298,9 @@ autofix_check_timeouts() {
 #   $5 = event_started_epoch  事件开始处理的 epoch，用于 1 小时总预算（多 ID 共享同一预算）
 analyze_one_log_id() {
   local first_log_id="$1"
+  # 保存用户原始输入的 ID（可能是 StepID）。后面 StepID 纠错会覆盖 first_log_id 成真 RunLogID，
+  # 但去重账本需要把原始输入也记上——否则同 case 用 StepID 报一次、用 RunLogID 报一次会重复分析。
+  local original_input_id="$1"
   local content="$2"
   local msg_id="$3"
   local root_msg_id="$4"
@@ -1570,11 +1573,13 @@ _正在按上述 span_id 拉取完整 input/output，继续调查。_" "ev${evid
   fi
   log "完成处理 $msg_id (trace=$first_trace)"
 
-  # 记录已分析账本：该日志ID + trace 已发结论，后续消息再出现同样的 ID/trace 不再重复分析。
-  # 裸存（日志ID 19位数字、trace 32位hex 格式不同不会冲突），过滤时 extract_log_ids 抽出的
-  # 也是裸值，直接 grep -xF 匹配。
+  # 记录已分析账本：同一条 case 的所有关联 ID 都记上（原始输入/StepID + 纠错后RunLogID + trace）。
+  # 同 case 不同表达方式（StepID vs RunLogID vs trace）任意一个命中，后续都不再重复分析。
+  # 裸存（日志ID 19位数字、trace 32位hex 格式不同不会冲突）。
   mark_logid_analyzed "$first_log_id"
   [[ -n "$first_trace" ]] && mark_logid_analyzed "$first_trace"
+  # 若发生过 StepID 纠错，原始输入与纠错后 RunLogID 不同，把原始输入也记上
+  [[ -n "$original_input_id" && "$original_input_id" != "$first_log_id" ]] && mark_logid_analyzed "$original_input_id"
 
   # autofix 触发：结论帖发出成功后，启动自动修复流程（复核→计划→审批→改码→MR）。
   # 仅在 autofix 启用时；trace_dir 复用本次已抓缓存，避免重复抓取。
